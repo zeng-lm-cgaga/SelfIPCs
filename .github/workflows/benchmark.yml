@@ -1,0 +1,50 @@
+name: benchmark
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: '30 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  formal-benchmark:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-linux
+      - name: Build the Release benchmark tools
+        run: cmake --preset release && cmake --build --preset release
+      - name: Collect and independently verify all four sections
+        shell: bash
+        run: |
+          mapfile -t cpus < <(python3 -c 'import os; print(*sorted(os.sched_getaffinity(0))[:2], sep="\n")')
+          test "${#cpus[@]}" -eq 2
+          out="$RUNNER_TEMP/selfipcs-benchmark"
+          mkdir -p "$out"
+          for section in spsc mpmc pool sustained; do
+            python3 scripts/run_formal_bench.py --section "$section" --output-root "$out" \
+              --messages 100000 --cpu-a "${cpus[0]}" --cpu-b "${cpus[1]}"
+          done
+          python3 scripts/verify_formal_bench.py --require-suite --input-root "$out" \
+            --output "$out/verified.json"
+      - name: Upload raw reports, environment, commands and checked results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-linux-x86_64-${{ github.sha }}
+          path: ${{ runner.temp }}/selfipcs-benchmark/
+          if-no-files-found: warn
+          retention-days: 14

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import shutil
@@ -14,7 +15,7 @@ import tempfile
 import time
 from typing import Iterable, Optional
 
-from self_ipcs_compat import validate_release_cache
+from self_ipcs_compat import default_build_dir, resolve_binary, validate_release_cache
 
 
 class AuditFailure(RuntimeError):
@@ -241,12 +242,29 @@ def run_audit(args: argparse.Namespace, root: pathlib.Path) -> pathlib.Path:
 	for preset in ("dev-debug", "asan-ubsan"):
 		run_command(f"{preset} configure", ["cmake", "--preset", preset], root, log_path, 300)
 		run_command(f"{preset} build", ["cmake", "--build", "--preset", preset], root, log_path, 900)
+		try:
+			run_command(
+				f"{preset} ctest",
+				["ctest", "--preset", preset, "--output-on-failure", "--no-tests=error",
+				 "--output-junit", str(run_dir / f"{preset}.xml")],
+				root, log_path, 900,
+			)
+		finally:
+			last_test = default_build_dir(root, preset) / "Testing" / "Temporary" / "LastTest.log"
+			if last_test.is_file():
+				shutil.copyfile(last_test, run_dir / f"{preset}-LastTest.log")
+
+	if args.full:
+		tools = default_build_dir(root, "dev-debug") / "tools"
 		run_command(
-			f"{preset} ctest",
-			["ctest", "--preset", preset, "--output-on-failure"],
-			root,
-			log_path,
-			900,
+			"full crash matrix C01-C23",
+			[str(resolve_binary(tools, "edge_crash_matrix")),
+			 "--producer", str(resolve_binary(tools, "edge_shm_producer")),
+			 "--consumer", str(resolve_binary(tools, "edge_shm_consumer")),
+			 "--ctl", str(resolve_binary(tools, "edge_shm_ctl")),
+			 "--supervisor", str(resolve_binary(tools, "edge_shm_supervisor")),
+			 "--out-dir", str(run_dir / "crash")],
+			root, log_path, 300,
 		)
 
 	release_build = scratch_dir / "build" / "selfipcs-release"
@@ -312,6 +330,55 @@ def run_audit(args: argparse.Namespace, root: pathlib.Path) -> pathlib.Path:
 	assert_downstream_sources(downstream_build, install_prefix, root)
 	run_command("downstream run", [str(downstream_build / "consume_demo")], root, log_path, 30)
 
+	if args.package:
+		from release_package import create_assets, extract_asset
+
+		packages = base / "packages"
+		create_assets(root, install_prefix, release_build, packages, full=args.full)
+		relocated = extract_asset(root, packages, scratch_dir / "relocated")
+		relocated_build = scratch_dir / "relocated-consumer"
+		run_command("relocated package consumer configure", [
+			"cmake", "-S", str(downstream_source), "-B", str(relocated_build),
+			"-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_PREFIX_PATH={relocated}",
+			f"-DSelfIPCs_DIR={relocated / 'lib/cmake/SelfIPCs'}",
+			"-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF", "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF",
+			"-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"], root, log_path, 300)
+		run_command("relocated package consumer build", ["cmake", "--build", str(relocated_build)],
+					root, log_path, 300)
+		assert_install(relocated, root)
+		assert_downstream_sources(relocated_build, relocated, root)
+		run_command("relocated package consumer run", [str(relocated_build / "consume_demo")],
+					root, log_path, 30)
+		for legacy_first in ("OFF", "ON"):
+			compat_source = scratch_dir / f"compat-source-{legacy_first}"
+			shutil.copytree(root / "examples/compat_demo", compat_source)
+			compat_build = scratch_dir / f"compat-build-{legacy_first}"
+			run_command(f"compat {legacy_first} configure", [
+				"cmake", "-S", str(compat_source), "-B", str(compat_build),
+				f"-DCMAKE_PREFIX_PATH={relocated}",
+				f"-DSelfIPCs_DIR={relocated / 'lib/cmake/SelfIPCs'}",
+				f"-DEdgeRuntime_DIR={relocated / 'lib/cmake/EdgeRuntime'}",
+				f"-DSELFIPCS_COMPAT_LEGACY_FIRST={legacy_first}",
+				"-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF", "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF"],
+				root, log_path, 300)
+			run_command(f"compat {legacy_first} build", ["cmake", "--build", str(compat_build)],
+						root, log_path, 300)
+			run_command(f"compat {legacy_first} run", ["ctest", "--test-dir", str(compat_build),
+				"--output-on-failure", "--no-tests=error"], root, log_path, 30)
+		source = extract_asset(root, packages, scratch_dir / "unpacked-source", source=True)
+		source_build = scratch_dir / "source-build"
+		run_command("source archive configure", ["cmake", "-S", str(source), "-B", str(source_build),
+			"-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=OFF", "-DSELFIPCS_ENABLE_FAILPOINTS=OFF",
+			"-DSELFIPCS_ENABLE_SANITIZERS=OFF"], root, log_path, 300)
+		run_command("source archive build", ["cmake", "--build", str(source_build), "--parallel", "2"],
+					root, log_path, 600)
+		print(f"[ci] release assets: {packages}")
+
+	(run_dir / "summary.json").write_text(json.dumps({
+		"success": True, "full_crash_matrix": args.full, "packaged": args.package,
+		"install_prefix": str(install_prefix), "release_build": str(release_build),
+	}, indent=2) + "\n", encoding="utf-8")
+
 	if not log_path.is_file():
 		raise AuditFailure("audit log disappeared")
 	print(f"[ci] transcript: {log_path}")
@@ -326,6 +393,8 @@ def main() -> int:
 	parser.add_argument("--out-dir", default=None)
 	parser.add_argument("--self-test-safety", action="store_true")
 	parser.add_argument("--validate-only", action="store_true")
+	parser.add_argument("--full", action="store_true", help="also execute the complete crash matrix")
+	parser.add_argument("--package", action="store_true", help="package and test relocatable release assets")
 	args = parser.parse_args()
 	root = repo_root()
 	try:

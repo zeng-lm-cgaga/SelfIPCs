@@ -1,48 +1,78 @@
-# CI — the SelfIPCs release-audit gate (design §26 completion definition).
-#
-# Same stages as scripts/ci.sh, run on a clean ubuntu-22.04 runner with the
-# required toolchain and GoogleTest development package. A green run on the
-# default branch is the evidence that the tree builds clean, all tests pass under dev-debug and
-# ASan/UBSan, release compiles failpoints out, and the installed package is
-# consumable by an independent downstream project.
-#
-#   scripts/ci.sh owns the ordered debug, sanitizer, Release install, and
-#   external downstream-consumer stages.
-#
-# Full crash matrix (C01-C23) and the ER7 12-run benchmark evidence set are
-# opt-in on the development host, not part of per-commit CI (see design §20.3
-# and §21). CI runs the same default ctest suite the presets ship.
-
 name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run the complete C01-C23 crash matrix
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      full:
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
-  release-audit:
+  automation-tests:
     runs-on: ubuntu-22.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build and test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake libgtest-dev python3
-
-      - name: Prepare per-user runtime directory
-        run: |
-          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "/run/user/$(id -u)"
-
-      - name: Release audit and independent downstream consumer
-        run: scripts/ci.sh --out-dir "$RUNNER_TEMP/selfipcs-ci"
-
-      - name: Upload release audit logs
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          name: release-audit-logs
-          path: ${{ runner.temp }}/selfipcs-ci/
-          if-no-files-found: ignore
-          retention-days: 7
+          persist-credentials: false
+      - name: Test release identity, checksums, archive safety and publication guards
+        run: python3 -m unittest discover -s test/automation -v
+
+  release-audit:
+    needs: automation-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      SELFIPCS_FULL: ${{ inputs.full || github.event_name == 'schedule' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-linux
+      - name: Debug, ASan/UBSan, Release and relocatable package consumers
+        shell: bash
+        run: |
+          args=(--package --out-dir "$RUNNER_TEMP/selfipcs-ci")
+          if [[ "$SELFIPCS_FULL" == true ]]; then args+=(--full); fi
+          bash scripts/ci.sh "${args[@]}"
+      - name: Upload transcripts, JUnit and crash evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-audit-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/selfipcs-ci/run-*/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload tested Ubuntu 22.04 release assets
+        if: matrix.os == 'ubuntu-22.04'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: selfipcs-release-assets
+          path: ${{ runner.temp }}/selfipcs-ci/packages/
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,13 @@
+name: SelfIPCs Linux build environment
+description: Install the supported toolchain and prepare process-shared runtime resources
+runs:
+  using: composite
+  steps:
+    - name: Install build and test dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends build-essential cmake libgtest-dev python3
+    - name: Prepare per-user runtime directory
+      shell: bash
+      run: sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "/run/user/$(id -u)"

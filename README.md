@@ -65,6 +65,33 @@ target_link_libraries(app PRIVATE SelfIPCs::self_ipcs)
 
 CMake 选项使用 `SELFIPCS_WARNINGS_AS_ERRORS`、`SELFIPCS_ENABLE_SANITIZERS`、`SELFIPCS_ENABLE_FAILPOINTS`，对应的 `EDGERUNTIME_*` 兼容选项同步到同一配置。首次配置同时指定冲突值会报错；重新配置时单独修改任一入口会同步另一入口。Debug 默认启用 failpoints，Release 默认关闭；ASan/UBSan preset 明确启用 sanitizer。
 
+## CI/CD
+
+GitHub Actions 提供三条工作流：
+
+| 工作流 | 触发方式 | 验证与交付 |
+|---|---|---|
+| [ci](.github/workflows/ci.yml) | `main` push、PR、手动、每周一 | Ubuntu 22.04/24.04 上执行 Debug、ASan/UBSan、Release、安装包重定位消费、新旧 CMake 入口及源码包重建；手动默认及每周运行完整 C01–C23 崩溃矩阵 |
+| [release](.github/workflows/release.yml) | 推送 `vX.Y.Z` 标签，或选定标签手动运行 | 校验 CMake 版本和 `main` 历史，复用完整 CI 和四组 benchmark，上传草稿、下载复核 SHA256 后公开 GitHub Release |
+| [benchmark](.github/workflows/benchmark.yml) | 手动、每周一 | Release 下串行采集 SPSC、MPMC、Pool、持续负载四组数据，独立验证配置、身份、交付和统计完整性 |
+
+CI 保存 JUnit、执行日志及崩溃现场 14 天；benchmark 保存环境、命令、二进制 SHA、raw worker report、CSV 和 `verified.json` 14 天。吞吐和延迟按采集环境解读，benchmark 工作流以数据完整性为通过条件。ASan/UBSan 沿用 `detect_leaks=0` 配置。
+
+发布产物包括 `SelfIPCs-X.Y.Z-linux-x86_64.tar.gz`、`SelfIPCs-X.Y.Z-source.tar.gz`、`release-manifest.json` 和 `SHA256SUMS`。预编译包基于 Ubuntu 22.04、GCC 11/glibc 2.35，包含静态库、公共头、CMake 包和工具。源码包按代码路径白名单生成，文档仅含 README。CD 负责库安装包分发，业务服务由使用该库的应用部署。
+
+从 [Releases](https://github.com/zeng-lm-cgaga/SelfIPCs/releases) 下载四个文件后执行：
+
+```bash
+sha256sum -c SHA256SUMS
+tar -xzf SelfIPCs-0.4.0-linux-x86_64.tar.gz
+cmake -S /path/to/your/app -B build \
+  -DCMAKE_PREFIX_PATH="$PWD/SelfIPCs-0.4.0-linux-x86_64"
+```
+
+维护者在确认 `main` 和 `CMakeLists.txt` 版本后创建对应标签，例如 `git tag -a v0.4.0 -m 'SelfIPCs 0.4.0'`、`git push origin v0.4.0`。发布任务仅在全部验证通过后取得写权限；已有 Release 保持原样，重复发布会报错，上传或下载复核失败时保留草稿与日志。
+
+本地复用完整发布校验：`bash scripts/ci.sh --full --package --out-dir /absolute/path/to/fresh-audit`。打包使用干净 Git checkout 和独立新输出目录。
+
 ## 配置与恢复边界
 
 - SPSC payload 始终计算并验证校验和。`enable_payload_checksum` 保留源码兼容，仅接受 `true`；`false` 返回 `InvalidOptions`。工具支持 `--checksum 1`，关闭或其他取值会明确报错。

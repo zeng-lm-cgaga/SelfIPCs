@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a version tag on main history
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          test "$REF_TYPE" = tag
+          python3 scripts/release_package.py check-tag --tag "$RELEASE_TAG"
+
+  verify:
+    needs: validate-tag
+    uses: ./.github/workflows/ci.yml
+    with:
+      full: true
+
+  benchmark:
+    needs: validate-tag
+    uses: ./.github/workflows/benchmark.yml
+
+  publish:
+    needs: [validate-tag, verify, benchmark]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: selfipcs-release-assets
+          path: ${{ runner.temp }}/release-assets
+      - name: Verify, stage, download-check and publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_ASSETS: ${{ runner.temp }}/release-assets
+        run: bash scripts/publish_release.sh
