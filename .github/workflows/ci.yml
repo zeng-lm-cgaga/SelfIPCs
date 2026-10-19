@@ -38,6 +38,18 @@ jobs:
           persist-credentials: false
       - name: Test release identity, checksums, archive safety and publication guards
         run: python3 -m unittest discover -s test/automation -v
+      - name: Check workflow definitions and shell syntax
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --location --retry 3 --connect-timeout 10 --max-time 60 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757 "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck=
+          bash -n scripts/ci.sh
+          bash -n scripts/publish_release.sh
 
   release-audit:
     needs: automation-tests
