@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import test_mpmc_payload_retry as retry
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "rendezvous uses Linux process signals")
 class RetryRendezvousTest(unittest.TestCase):
     def test_startup_delay_does_not_consume_measured_hold(self):
         marker = Mock()
