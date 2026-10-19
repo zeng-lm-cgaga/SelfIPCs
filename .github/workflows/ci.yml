@@ -1,8 +1,8 @@
 # CI — the SelfIPCs release-audit gate (design §26 completion definition).
 #
 # Same stages as scripts/ci.sh, run on a clean ubuntu-22.04 runner with the
-# contract toolchain (GCC 11, CMake 3.22). A green run on the default branch is
-# the evidence that the tree builds clean, all tests pass under dev-debug and
+# required toolchain and GoogleTest development package. A green run on the
+# default branch is the evidence that the tree builds clean, all tests pass under dev-debug and
 # ASan/UBSan, release compiles failpoints out, and the installed package is
 # consumable by an independent downstream project.
 #
@@ -26,10 +26,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
+      - name: Install build and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ cmake
+          sudo apt-get install -y --no-install-recommends build-essential cmake libgtest-dev python3
+
+      - name: Prepare per-user runtime directory
+        run: |
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "/run/user/$(id -u)"
 
       - name: Release audit and independent downstream consumer
         run: scripts/ci.sh --out-dir "$RUNNER_TEMP/selfipcs-ci"
+
+      - name: Upload release audit logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-audit-logs
+          path: ${{ runner.temp }}/selfipcs-ci/
+          if-no-files-found: ignore
+          retention-days: 7

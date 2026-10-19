@@ -23,6 +23,15 @@ SPSC 支持 POSIX shm、memfd + SCM_RIGHTS 和共享槽位的原地读写。
 
 环境：Ubuntu 22.04 / Linux ≥ 5.15、GCC 11、CMake 3.22。新构建使用 `build/selfipcs-debug`、`build/selfipcs-asan-ubsan`、`build/selfipcs-release`。
 
+Ubuntu 构建和测试依赖：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends build-essential cmake libgtest-dev python3
+```
+
+通道控制文件和 broker socket 使用当前用户的 `/run/user/<uid>/edgeruntime/`。登录会话通常会准备 `/run/user/<uid>`；无登录会话的 CI 或服务可先执行 `sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "/run/user/$(id -u)"`。
+
 ```bash
 cmake --preset dev-debug && cmake --build --preset dev-debug
 ctest --preset dev-debug

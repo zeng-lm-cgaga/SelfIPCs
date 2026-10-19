@@ -995,6 +995,16 @@ static bool run_c17(CaseDriver& d) {
 	const std::string sock = detail::channel_socket_path(name);
 
 	{
+		auto lock = detail::ControlLock::acquire(detail::channel_lock_path(name));
+		if (!lock) {
+			d.fail("C17 prepare control directory failed: " +
+			       std::string(to_string(lock.error().code)));
+			d.finish_case(gen_pids_line("C17", CrashChild{}));
+			return d.ok();
+		}
+	}
+
+	{
 		const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 		if (fd < 0) {
 			d.fail("C17 stage socket failed");
