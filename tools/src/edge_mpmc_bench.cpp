@@ -151,11 +151,13 @@ struct Config {
 	uint64_t test_consumer_hold_ms = 0;
 	uint64_t test_consumer_delay_us = 0;
 	bool test_ignore_term_consumer = false;
+	bool test_consumer_stop = false;
 	bool keep_worker_reports = false;
 	RetryPolicy retry_policy = RetryPolicy::kYield;
 	WaitPolicy wait_policy = WaitPolicy::kBusy;
 	std::string out_dir;
 	std::string ready_file;
+	std::string test_retry_ready_file;
 };
 
 struct ChildProcess {
@@ -441,6 +443,7 @@ int run_child_producer(int argc, char** argv) {
 	        static_cast<uint32_t>(edge_tool::arg_u64(argc, argv, "--capacity", 0));
 	const uint32_t producer_id =
 	        static_cast<uint32_t>(edge_tool::arg_u64(argc, argv, "--producer-id", 0));
+	const char* test_retry_ready_file = edge_tool::arg_value(argc, argv, "--test-retry-ready-file");
 	const uint64_t messages = edge_tool::arg_u64(argc, argv, "--messages", 0);
 	const uint64_t wait_timeout_ms = edge_tool::arg_u64(argc, argv, "--wait-timeout-ms", 30000);
 	RetryPolicy retry_policy;
@@ -472,6 +475,24 @@ int run_child_producer(int argc, char** argv) {
 					break;
 				}
 				auto pushed = queue.value().try_push(payload);
+				// Test-only rendezvous: the payload already exists and a real Full was observed.
+				if (test_retry_ready_file != nullptr && !pushed &&
+				    pushed.error().code == ErrorCode::kQueueFull) {
+					FILE* ready = std::fopen(test_retry_ready_file, "wx");
+					bool ok = ready != nullptr;
+					if (ready != nullptr) {
+						ok = std::fprintf(ready, "RETRY_READY pid=%ld sequence=%" PRIu64 "\n",
+						                  static_cast<long>(::getpid()), sequence) >= 0;
+						if (std::fclose(ready) != 0) ok = false;
+					}
+					if (!ok) {
+						note_error(&header, ErrorCode::kSystemError);
+						success = false;
+						sequence = messages;
+						break;
+					}
+					test_retry_ready_file = nullptr;
+				}
 				if (g_stop_requested) {
 					success = false;
 					break;
@@ -569,6 +590,9 @@ int run_child_consumer(int argc, char** argv) {
 	}
 	if (queue) {
 		report_ready(ready_fd, 'R');
+		if (edge_tool::arg_flag(argc, argv, "--test-consumer-stop") && ::raise(SIGSTOP) != 0) {
+			return 2;
+		}
 		if (test_consumer_hold_ms != 0) {
 			::usleep(static_cast<useconds_t>(test_consumer_hold_ms * 1000ull));
 		}
@@ -923,6 +947,7 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 		        std::to_string(config.test_consumer_delay_us), "--ready-fd",
 		        std::to_string(ready_pipe[1]), "--report-file", report};
 		if (config.test_ignore_term_consumer) args.push_back("--test-ignore-term-consumer");
+		if (config.test_consumer_stop) args.push_back("--test-consumer-stop");
 		const pid_t pid = spawn_child(executable, args);
 		if (pid < 0) {
 			std::fprintf(stderr, "FORK_FAIL run=%" PRIu32 " role=consumer errno=%d\n", run_index,
@@ -940,7 +965,7 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 			++aggregate.errors;
 			continue;
 		}
-		const std::vector<std::string> args = {
+		std::vector<std::string> args = {
 		        executable, "--role", "producer", "--payload-size", std::to_string(kSize),
 		        "--name", queue_name, "--capacity", std::to_string(config.capacity),
 		        "--producer-id", std::to_string(i), "--messages",
@@ -949,6 +974,10 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 		        wait_policy_name(config.wait_policy), "--wait-timeout-ms",
 		        std::to_string(config.timeout_ms), "--ready-fd", std::to_string(ready_pipe[1]),
 		        "--report-file", report};
+		if (!config.test_retry_ready_file.empty()) {
+			args.push_back("--test-retry-ready-file");
+			args.push_back(config.test_retry_ready_file);
+		}
 		const pid_t pid = spawn_child(executable, args);
 		if (pid < 0) {
 			std::fprintf(stderr, "FORK_FAIL run=%" PRIu32 " role=producer errno=%d\n", run_index,
@@ -1118,10 +1147,12 @@ bool parse_config(int argc, char** argv, Config* config) {
 	        edge_tool::arg_u64(argc, argv, "--test-consumer-delay-us", 0);
 	config->test_ignore_term_consumer =
 	        edge_tool::arg_flag(argc, argv, "--test-ignore-term-consumer");
+	config->test_consumer_stop = edge_tool::arg_flag(argc, argv, "--test-consumer-stop");
 	if (!parse_retry_policy_args(argc, argv, &config->retry_policy)) return false;
 	if (!parse_wait_policy_args(argc, argv, &config->wait_policy)) return false;
 	const char* out_dir = edge_tool::arg_value(argc, argv, "--out-dir");
 	const char* ready_file = edge_tool::arg_value(argc, argv, "--ready-file");
+	const char* retry_ready_file = edge_tool::arg_value(argc, argv, "--test-retry-ready-file");
 	config->keep_worker_reports = edge_tool::arg_flag(argc, argv, "--keep-worker-reports");
 	if (config->keep_worker_reports && (out_dir == nullptr || *out_dir == '\0')) {
 		std::fprintf(stderr, "--keep-worker-reports requires --out-dir\n");
@@ -1142,6 +1173,11 @@ bool parse_config(int argc, char** argv, Config* config) {
 	config->runs = static_cast<uint32_t>(runs);
 	config->out_dir = out_dir == nullptr ? "" : out_dir;
 	config->ready_file = ready_file == nullptr ? "" : ready_file;
+	config->test_retry_ready_file = retry_ready_file == nullptr ? "" : retry_ready_file;
+	if (!config->test_retry_ready_file.empty() && producers != 1) {
+		std::fprintf(stderr, "--test-retry-ready-file requires exactly one producer\n");
+		return false;
+	}
 	if (messages > std::numeric_limits<uint64_t>::max() / producers) {
 		std::fprintf(stderr, "expected message count overflows\n");
 		return false;
@@ -1155,6 +1191,7 @@ void print_usage(const char* executable) {
 	        "[--messages N] [--capacity N] [--runs N] [--timeout-ms N] "
 	        "[--test-consumer-hold-ms N] [--test-consumer-delay-us N] "
 	        "[--test-ignore-term-consumer] [--retry-policy yield|spin] "
+	        "[--test-consumer-stop] [--test-retry-ready-file FILE] "
 	        "[--wait-policy busy|blocking] [--out-dir DIR] [--keep-worker-reports] "
 	        "[--ready-file FILE]\n"
 	        "       %s --smoke\n",

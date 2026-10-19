@@ -38,34 +38,37 @@ def has_role(pid: int, role: str) -> bool:
         return False
 
 
-def stop_consumer(pid: int, timeout_s: float) -> tuple[int, int]:
+def stop_consumer(pid: int, retry_ready: Path, timeout_s: float) -> tuple[int, int]:
     deadline = time.monotonic() + timeout_s
+    stopped_pid = None
     while time.monotonic() < deadline:
         for child in children_of(pid):
             if has_role(child, "consumer"):
                 try:
-                    os.kill(child, signal.SIGSTOP)
-                    stopped_ns = time.monotonic_ns()
-                    producer_deadline = time.monotonic() + 2.0
-                    producer_seen = False
-                    while time.monotonic() < producer_deadline:
-                        producer_seen = any(has_role(candidate, "producer")
-                                            for candidate in children_of(pid))
-                        if producer_seen:
-                            break
-                        time.sleep(0.001)
-                    if not producer_seen:
-                        os.kill(child, signal.SIGCONT)
-                        raise RuntimeError("native benchmark producer was not observed")
-                    remaining = 0.15 - (time.monotonic_ns() - stopped_ns) / 1_000_000_000
-                    if remaining > 0:
-                        time.sleep(remaining)
+                    state = Path(f"/proc/{child}/status").read_text()
+                    if not any(line.startswith("State:") and "T" in line.split()[1]
+                               for line in state.splitlines()):
+                        continue
+                    stopped_pid = child
+                    if not retry_ready.is_file():
+                        continue
+                    marker = retry_ready.read_text()
+                    if not marker.startswith("RETRY_READY ") or "sequence=1\n" not in marker:
+                        continue
+                    # The payload exists and QueueFull has actually occurred before this hold.
+                    started_ns = time.monotonic_ns()
+                    time.sleep(0.15)
                     os.kill(child, signal.SIGCONT)
-                    return child, time.monotonic_ns() - stopped_ns
-                except ProcessLookupError:
+                    return child, time.monotonic_ns() - started_ns
+                except (ProcessLookupError, FileNotFoundError):
                     continue
         time.sleep(0.001)
-    raise RuntimeError("native benchmark consumer was not observed")
+    if stopped_pid is not None:
+        try:
+            os.kill(stopped_pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+    raise RuntimeError("stopped consumer and native QueueFull rendezvous were not observed")
 
 
 def parse_result(text: str) -> dict[str, str]:
@@ -86,10 +89,12 @@ def run_case(binary: Path, wait_policy: str, root: Path) -> dict[str, object]:
     case_dir.mkdir()
     csv_dir = case_dir / "latency"
     csv_dir.mkdir()
+    retry_ready = case_dir / "retry.ready"
     argv = [
         str(binary), "--payload-size", "64", "--producers", "1", "--consumers", "1",
         "--messages", "2", "--capacity", "1", "--runs", "1", "--timeout-ms", "10000",
-        "--test-consumer-hold-ms", "150", "--retry-policy", "yield", "--wait-policy",
+        "--test-consumer-stop", "--test-retry-ready-file", str(retry_ready),
+        "--retry-policy", "yield", "--wait-policy",
         wait_policy, "--out-dir", str(csv_dir),
     ]
     env = os.environ.copy()
@@ -108,7 +113,7 @@ def run_case(binary: Path, wait_policy: str, root: Path) -> dict[str, object]:
             process = subprocess.Popen(
                 argv, cwd=root, env=env, stdout=stdout, stderr=stderr,
                 start_new_session=True, close_fds=True, text=True)
-            stopped_pid, held_ns = stop_consumer(process.pid, 5.0)
+            stopped_pid, held_ns = stop_consumer(process.pid, retry_ready, 5.0)
             try:
                 process.wait(timeout=20.0)
             except subprocess.TimeoutExpired:
