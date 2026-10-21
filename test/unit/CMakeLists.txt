@@ -30,6 +30,7 @@ edgeruntime_unit_test(producer_concurrency_test)  # 同一句柄并发调用约�
 edgeruntime_unit_test(loan_test)                  # 借用槽所有权与延迟关闭
 edgeruntime_unit_test(supervisor_policy_test)     # 重启上限、退避和参数边界
 edgeruntime_unit_test(mpmc_layout_test)           # MPMC 共享内存 ABI 和映射边界
+edgeruntime_unit_test(queue_feature_test PROPERTIES TIMEOUT 10)
 edgeruntime_unit_test(shared_buffer_pool_test)    # 固定块池 ABI、状态和 handle 校验
 edgeruntime_unit_test(owner_snapshot_test)        # MPMC/Pool 共享 owner tuple 与 epoch 边界
 edgeruntime_unit_test(identity_failure_test)

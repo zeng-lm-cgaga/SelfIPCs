@@ -2,13 +2,14 @@
 #define EDGE_RUNTIME_COMMON_CANCELLATION_HPP
 
 #include <memory>
+#include <utility>
 
 namespace edge_runtime {
 
 namespace detail {
 struct CancellationState;
 class CancellationRegistration;
-}
+}  // namespace detail
 
 class CancellationToken {
        public:
@@ -33,6 +34,6 @@ class CancellationSource {
 	std::shared_ptr<detail::CancellationState> state_;
 };
 
-}
+}  // namespace edge_runtime
 
 #endif

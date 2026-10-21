@@ -1,24 +1,26 @@
 #include "edge_runtime/queue/mpmc_queue.hpp"
 
-#include "edge_runtime/utility/checksum.hpp"
-#include "edge_runtime/utility/failpoint.hpp"
-#include "edge_runtime/queue/mpmc_layout.hpp"
-#include "edge_runtime/process/process_identity.hpp"
-#include "edge_runtime/utility/random.hpp"
-#include "edge_runtime/sync/shared_atomic.hpp"
-#include "edge_runtime/sync/owner_snapshot.hpp"
-#include "edge_runtime/sync/futex.hpp"
-#include "edge_runtime/transport/shm_object.hpp"
-#include "edge_runtime/channel/channel_layout.hpp"
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <climits>
-#include <cerrno>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 
-#include <unistd.h>
+#include "edge_runtime/channel/channel_layout.hpp"
+#include "edge_runtime/process/process_identity.hpp"
+#include "edge_runtime/queue/mpmc_layout.hpp"
+#include "edge_runtime/sync/cancellation.hpp"
+#include "edge_runtime/sync/futex.hpp"
+#include "edge_runtime/sync/owner_snapshot.hpp"
+#include "edge_runtime/sync/shared_atomic.hpp"
+#include "edge_runtime/transport/shm_object.hpp"
+#include "edge_runtime/utility/checksum.hpp"
+#include "edge_runtime/utility/failpoint.hpp"
+#include "edge_runtime/utility/local_diagnostics.hpp"
+#include "edge_runtime/utility/random.hpp"
 
 namespace edge_runtime::detail {
 
@@ -29,6 +31,7 @@ struct MpmcQueueHandle {
 	uint64_t slot_stride{0};
 	bool created{false};
 	bool removed{false};
+	LocalDiagnostics diagnostics;
 
 	MpmcQueueHeaderAbi* header() noexcept {
 		return static_cast<MpmcQueueHeaderAbi*>(object.mapping.get());
@@ -372,6 +375,7 @@ void notify_waiters(MpmcQueueHandle* handle) noexcept {
 	if (disabled != nullptr && std::strcmp(disabled, "1") == 0) return;
 #endif
 	(void)shared_fetch_add_relaxed(&handle->header()->notify_epoch, uint32_t{1});
+	handle->diagnostics.add(DiagnosticCounter::kNotifications);
 	(void)futex_wake(&handle->header()->notify_epoch, INT_MAX);
 }
 
@@ -526,6 +530,12 @@ Result<void> validate_ticket_bounds(uint64_t ticket, uint32_t capacity,
 Result<void> validate_live_handle(const std::shared_ptr<MpmcQueueHandle>& handle,
                                   const char* operation) noexcept {
 	if (!handle || handle->removed) return make_error(ErrorCode::kStaleHandle, operation);
+	if (handle->self.pid != static_cast<uint64_t>(::getpid())) {
+		return make_error(ErrorCode::kStaleHandle, operation, "reopen handle after fork");
+	}
+	if (shared_load_acquire(&handle->header()->closed) > 1) {
+		return make_error(ErrorCode::kRecoveryBlocked, operation, "invalid close state");
+	}
 	if (shared_load_acquire(&handle->header()->init_state) !=
 	    static_cast<uint32_t>(MpmcInitState::kReady)) {
 		return make_error(ErrorCode::kInitializationIncomplete, operation,
@@ -599,7 +609,7 @@ Result<std::shared_ptr<MpmcQueueHandle>> open_existing(const MpmcQueueOptions& o
 	    header->header_size != sizeof(MpmcQueueHeaderAbi) ||
 	    object.size < sizeof(MpmcQueueHeaderAbi)) {
 		return make_error(ErrorCode::kAbiMismatch, "MpmcQueue::open",
-		                  "queue requires the v2 MPMC mapping ABI");
+		                  "queue requires the v3 MPMC mapping ABI");
 	}
 	const uint32_t init = shared_load_acquire(&header->init_state);
 	if (init != static_cast<uint32_t>(MpmcInitState::kReady)) {
@@ -730,12 +740,15 @@ Result<std::shared_ptr<MpmcQueueHandle>> mpmc_open_impl(const MpmcQueueOptions& 
 	return open_existing(options, schema, payload_size);
 }
 
-Result<void> mpmc_try_push_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
-                                const void* payload, uint32_t payload_size) noexcept {
+static Result<void> mpmc_try_push_once(const std::shared_ptr<MpmcQueueHandle>& handle,
+                                       const void* payload, uint32_t payload_size) noexcept {
 	auto valid = validate_live_handle(handle, "MpmcQueue::try_push");
 	if (!valid) return valid.error();
 	if (payload == nullptr || payload_size != handle->header()->payload_size) {
 		return make_error(ErrorCode::kInvalidOptions, "MpmcQueue::try_push", "payload size mismatch");
+	}
+	if (shared_load_acquire(&handle->header()->closed) != 0) {
+		return make_error(ErrorCode::kClosed, "MpmcQueue::try_push", "queue is closed");
 	}
 	const uint32_t capacity = handle->header()->capacity;
 	auto position_snapshot = snapshot_queue_positions(handle->header(), "MpmcQueue::try_push");
@@ -784,6 +797,10 @@ Result<void> mpmc_try_push_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
 	if (!admission) return admission.error();
 	auto gate = acquire_gate(handle.get(), true);
 	if (!gate) return gate.error();
+	if (shared_load_acquire(&handle->header()->closed) != 0) {
+		release_gate(handle.get(), true);
+		return make_error(ErrorCode::kClosed, "MpmcQueue::try_push", "queue is closed");
+	}
 	EDGE_FAILPOINT(MPMC_ENQUEUE_GATE_OWNED);
 	position_snapshot = snapshot_queue_positions(handle->header(), "MpmcQueue::try_push");
 	if (!position_snapshot) {
@@ -899,13 +916,14 @@ Result<void> mpmc_try_push_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
 	return Result<void>::ok();
 }
 
-Result<void> mpmc_try_pop_impl(const std::shared_ptr<MpmcQueueHandle>& handle, void* payload,
-                               uint32_t payload_size) noexcept {
+static Result<void> mpmc_try_pop_once(const std::shared_ptr<MpmcQueueHandle>& handle, void* payload,
+                                      uint32_t payload_size) noexcept {
 	auto valid = validate_live_handle(handle, "MpmcQueue::try_pop");
 	if (!valid) return valid.error();
 	if (payload == nullptr || payload_size != handle->header()->payload_size) {
 		return make_error(ErrorCode::kInvalidOptions, "MpmcQueue::try_pop", "payload size mismatch");
 	}
+	const bool closed = shared_load_acquire(&handle->header()->closed) != 0;
 	const uint32_t capacity = handle->header()->capacity;
 	auto position_snapshot = snapshot_queue_positions(handle->header(), "MpmcQueue::try_pop");
 	if (!position_snapshot) return position_snapshot.error();
@@ -913,6 +931,13 @@ Result<void> mpmc_try_pop_impl(const std::shared_ptr<MpmcQueueHandle>& handle, v
 	uint64_t dequeue = position_snapshot.value().dequeue;
 	auto positions = validate_queue_positions(enqueue, dequeue, capacity, "MpmcQueue::try_pop");
 	if (!positions) return positions.error();
+	if (closed && dequeue == enqueue) {
+		const uint32_t state = shared_load_seq_cst(&handle->header()->dequeue_lock);
+		if (state != static_cast<uint32_t>(MpmcLockState::kFree)) {
+			return gate_busy_result(handle.get(), false, state);
+		}
+		return make_error(ErrorCode::kClosed, "MpmcQueue::try_pop", "queue is drained");
+	}
 	uint64_t next_dequeue = 0;
 	uint64_t reclaim_sequence = 0;
 	auto bounds = validate_ticket_bounds(dequeue, capacity, &next_dequeue, &reclaim_sequence,
@@ -924,6 +949,9 @@ Result<void> mpmc_try_pop_impl(const std::shared_ptr<MpmcQueueHandle>& handle, v
 		if (dequeue_state != static_cast<uint32_t>(MpmcLockState::kFree)) {
 			return gate_busy_result(handle.get(), false, dequeue_state);
 		}
+		if (closed)
+			return make_error(ErrorCode::kClosed, "MpmcQueue::try_pop",
+			                  "queue is drained");
 		const OwnerObservation producer = classify_gate_owner(handle.get(), true);
 		const OwnerObservationDisposition producer_state =
 		        owner_observation_is_unrecoverable(handle.get(), true, producer);
@@ -957,6 +985,10 @@ Result<void> mpmc_try_pop_impl(const std::shared_ptr<MpmcQueueHandle>& handle, v
 	if (!positions) {
 		release_gate(handle.get(), false);
 		return positions.error();
+	}
+	if (closed && dequeue == enqueue) {
+		release_gate(handle.get(), false);
+		return make_error(ErrorCode::kClosed, "MpmcQueue::try_pop", "queue is drained");
 	}
 	bounds = validate_ticket_bounds(dequeue, capacity, &next_dequeue, &reclaim_sequence,
 	                               "MpmcQueue::try_pop");
@@ -1050,15 +1082,11 @@ bool is_pop_waitable(ErrorCode code) noexcept {
 	return code == ErrorCode::kQueueEmpty || code == ErrorCode::kQueueContention;
 }
 
-bool deadline_has_time(std::chrono::steady_clock::time_point deadline) noexcept {
-	static_assert(std::chrono::steady_clock::is_steady, "MPMC wait requires a steady clock");
-	return deadline > std::chrono::steady_clock::now();
-}
-
 bool remaining_wait_ns(std::chrono::steady_clock::time_point deadline,
                        uint64_t* remaining_ns) noexcept {
-	const auto remaining = deadline - std::chrono::steady_clock::now();
-	if (remaining <= std::chrono::steady_clock::duration::zero()) return false;
+	const auto now = std::chrono::steady_clock::now();
+	if (deadline <= now) return false;
+	const auto remaining = deadline - now;
 	const auto converted = std::chrono::duration_cast<std::chrono::nanoseconds>(remaining);
 	if (converted.count() <= 0) {
 		*remaining_ns = 1;
@@ -1084,6 +1112,7 @@ Result<void> wait_on_notify_epoch(MpmcQueueHandle* handle,
 		return make_error(ErrorCode::kTimeout, "MpmcQueue::wait", "deadline expired");
 	}
 	const timespec timeout = relative_wait_timespec(remaining_ns);
+	handle->diagnostics.add(DiagnosticCounter::kWaits);
 	const int rc = futex_wait(&handle->header()->notify_epoch, expected, &timeout);
 	if (rc == 0) return Result<void>::ok();
 	const int saved_errno = errno;
@@ -1096,86 +1125,207 @@ Result<void> wait_on_notify_epoch(MpmcQueueHandle* handle,
 
 }  // namespace
 
-Result<void> mpmc_wait_push_until_impl(
-        const std::shared_ptr<MpmcQueueHandle>& handle, const void* payload,
-        uint32_t payload_size, std::chrono::steady_clock::time_point deadline) noexcept {
-	for (;;) {
-		auto attempt = mpmc_try_push_impl(handle, payload, payload_size);
-		if (attempt) return attempt;
-		if (!is_push_waitable(attempt.error().code)) return attempt.error();
-		if (!deadline_has_time(deadline)) {
-			return make_error(ErrorCode::kTimeout, "MpmcQueue::wait_push_until",
-			                  "deadline expired while queue was not writable");
-		}
+Result<void> mpmc_try_push_impl(const std::shared_ptr<MpmcQueueHandle>& handle, const void* payload,
+                                uint32_t payload_size) noexcept {
+	if (handle) handle->diagnostics.add(DiagnosticCounter::kPushAttempts);
+	auto result = mpmc_try_push_once(handle, payload, payload_size);
+	if (handle) {
+		if (result)
+			handle->diagnostics.add(DiagnosticCounter::kPushSuccesses);
+		else
+			handle->diagnostics.record_error(result.error().code);
+	}
+	return result;
+}
 
+Result<void> mpmc_try_pop_impl(const std::shared_ptr<MpmcQueueHandle>& handle, void* payload,
+                               uint32_t payload_size) noexcept {
+	if (handle) handle->diagnostics.add(DiagnosticCounter::kPopAttempts);
+	auto result = mpmc_try_pop_once(handle, payload, payload_size);
+	if (handle) {
+		if (result)
+			handle->diagnostics.add(DiagnosticCounter::kPopSuccesses);
+		else
+			handle->diagnostics.record_error(result.error().code);
+	}
+	return result;
+}
+
+namespace {
+
+Result<void> wait_until(const std::shared_ptr<MpmcQueueHandle>& input, const void* push_payload,
+                        void* pop_payload, uint32_t payload_size,
+                        std::chrono::steady_clock::time_point deadline,
+                        const CancellationToken& token, bool pushing) noexcept {
+	const auto handle = input;
+	auto valid = validate_live_handle(handle, "MpmcQueue::wait");
+	if (!valid) return valid.error();
+	handle->diagnostics.add(DiagnosticCounter::kWaitCalls);
+	CancellationRegistration registration(token, &handle->header()->notify_epoch);
+	for (;;) {
 		const uint32_t before = shared_load_acquire(&handle->header()->notify_epoch);
-		attempt = mpmc_try_push_impl(handle, payload, payload_size);
+		auto attempt = pushing ? mpmc_try_push_impl(handle, push_payload, payload_size)
+		                       : mpmc_try_pop_impl(handle, pop_payload, payload_size);
 		if (attempt) return attempt;
-		if (!is_push_waitable(attempt.error().code)) return attempt.error();
-		const uint32_t after = shared_load_acquire(&handle->header()->notify_epoch);
-		if (before != after) continue;
-		auto waited = wait_on_notify_epoch(handle.get(), deadline, after);
-		if (!waited) {
-			if (waited.error().code == ErrorCode::kTimeout) {
-				return make_error(ErrorCode::kTimeout, "MpmcQueue::wait_push_until",
-				                  "deadline expired while queue was not writable");
+		if (!(pushing ? is_push_waitable(attempt.error().code)
+		              : is_pop_waitable(attempt.error().code)))
+			return attempt.error();
+		if (!pushing && attempt.error().code == ErrorCode::kQueueEmpty) {
+			auto budget =
+			        dequeue_drain_budget(handle.get(), "MpmcQueue::wait_pop_until");
+			if (!budget && budget.error().code != ErrorCode::kQueueContention)
+				return budget.error();
+			if (budget && budget.value() == 0) {
+				return make_error(ErrorCode::kSequenceExhausted, "MpmcQueue::wait_pop_until",
+				                  "dequeue gate has no remaining drain budget");
 			}
-			return waited.error();
 		}
+		if (token.is_cancelled()) {
+			handle->diagnostics.add(DiagnosticCounter::kCancelled);
+			return make_error(ErrorCode::kCancelled, "MpmcQueue::wait",
+			                  "wait cancelled");
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			handle->diagnostics.add(DiagnosticCounter::kTimeouts);
+			return make_error(ErrorCode::kTimeout, "MpmcQueue::wait",
+			                  "deadline expired");
+		}
+		if (before != shared_load_acquire(&handle->header()->notify_epoch)) continue;
+		auto waited = wait_on_notify_epoch(handle.get(), deadline, before);
+		if (!waited && waited.error().code != ErrorCode::kTimeout) return waited.error();
 	}
 }
 
-Result<void> mpmc_wait_pop_until_impl(
-        const std::shared_ptr<MpmcQueueHandle>& handle, void* payload, uint32_t payload_size,
-        std::chrono::steady_clock::time_point deadline) noexcept {
-	for (;;) {
-		auto attempt = mpmc_try_pop_impl(handle, payload, payload_size);
-		if (attempt) return attempt;
-		if (!is_pop_waitable(attempt.error().code)) return attempt.error();
-		if (attempt.error().code == ErrorCode::kQueueEmpty) {
-			auto drain_budget = dequeue_drain_budget(handle.get(),
-			                                       "MpmcQueue::wait_pop_until");
-			if (!drain_budget) {
-				if (drain_budget.error().code != ErrorCode::kQueueContention) {
-					return drain_budget.error();
-				}
-			} else if (drain_budget.value() == 0) {
-				return make_error(ErrorCode::kSequenceExhausted, "MpmcQueue::wait_pop_until",
-				                  "dequeue gate has no remaining drain budget");
-			}
-		}
-		if (!deadline_has_time(deadline)) {
-			return make_error(ErrorCode::kTimeout, "MpmcQueue::wait_pop_until",
-			                  "deadline expired while queue was not readable");
-		}
-
-		const uint32_t before = shared_load_acquire(&handle->header()->notify_epoch);
-		attempt = mpmc_try_pop_impl(handle, payload, payload_size);
-		if (attempt) return attempt;
-		if (!is_pop_waitable(attempt.error().code)) return attempt.error();
-		if (attempt.error().code == ErrorCode::kQueueEmpty) {
-			auto drain_budget = dequeue_drain_budget(handle.get(),
-			                                       "MpmcQueue::wait_pop_until");
-			if (!drain_budget) {
-				if (drain_budget.error().code != ErrorCode::kQueueContention) {
-					return drain_budget.error();
-				}
-			} else if (drain_budget.value() == 0) {
-				return make_error(ErrorCode::kSequenceExhausted, "MpmcQueue::wait_pop_until",
-				                  "dequeue gate has no remaining drain budget");
-			}
-		}
-		const uint32_t after = shared_load_acquire(&handle->header()->notify_epoch);
-		if (before != after) continue;
-		auto waited = wait_on_notify_epoch(handle.get(), deadline, after);
-		if (!waited) {
-			if (waited.error().code == ErrorCode::kTimeout) {
-				return make_error(ErrorCode::kTimeout, "MpmcQueue::wait_pop_until",
-				                  "deadline expired while queue was not readable");
-			}
-			return waited.error();
-		}
+BatchResult stopped_batch(size_t count, const Error& error) noexcept {
+	BatchStopReason reason = BatchStopReason::kError;
+	switch (error.code) {
+		case ErrorCode::kQueueFull:
+			reason = BatchStopReason::kFull;
+			break;
+		case ErrorCode::kQueueEmpty:
+			reason = BatchStopReason::kEmpty;
+			break;
+		case ErrorCode::kClosed:
+			reason = BatchStopReason::kClosed;
+			break;
+		case ErrorCode::kCancelled:
+			reason = BatchStopReason::kCancelled;
+			break;
+		case ErrorCode::kQueueContention:
+			reason = BatchStopReason::kContention;
+			break;
+		default:
+			break;
 	}
+	return {count, reason, error};
+}
+
+BatchResult try_batch(const std::shared_ptr<MpmcQueueHandle>& input, const void* push_payload,
+                      void* pop_payload, uint32_t payload_size, size_t count,
+                      const CancellationToken& token, bool pushing) noexcept {
+	const auto handle = input;
+	auto valid = validate_live_handle(handle, "MpmcQueue::try_batch");
+	if (!valid) return stopped_batch(0, valid.error());
+	handle->diagnostics.add(DiagnosticCounter::kBatchCalls);
+	uint64_t total_bytes = 0;
+	if (count > kMpmcMaxBatchSize || payload_size == 0 || payload_size > kMpmcMaxPayloadSize ||
+	    !checked_mul_u64(count, payload_size, &total_bytes) || total_bytes > SIZE_MAX ||
+	    payload_size != handle->header()->payload_size ||
+	    (count != 0 && (pushing ? push_payload == nullptr : pop_payload == nullptr))) {
+		return stopped_batch(0,
+		                     make_error(ErrorCode::kInvalidOptions, "MpmcQueue::try_batch",
+		                                "invalid pointer, element size or batch count"));
+	}
+	for (size_t index = 0; index < count; ++index) {
+		if (token.is_cancelled()) {
+			handle->diagnostics.add(DiagnosticCounter::kCancelled);
+			return stopped_batch(
+			        index, make_error(ErrorCode::kCancelled, "MpmcQueue::try_batch",
+			                          "batch cancelled"));
+		}
+		const size_t offset = index * static_cast<size_t>(payload_size);
+		auto result =
+		        pushing ? mpmc_try_push_impl(
+		                          handle,
+		                          static_cast<const std::byte*>(push_payload) + offset,
+		                          payload_size)
+		                : mpmc_try_pop_impl(handle,
+		                                    static_cast<std::byte*>(pop_payload) + offset,
+		                                    payload_size);
+		if (!result) return stopped_batch(index, result.error());
+	}
+	return {count, BatchStopReason::kComplete, {}};
+}
+
+}  // namespace
+
+Result<void> mpmc_wait_push_until_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
+                                       const void* payload, uint32_t payload_size,
+                                       std::chrono::steady_clock::time_point deadline) noexcept {
+	return mpmc_wait_push_until_impl(handle, payload, payload_size, deadline, {});
+}
+
+Result<void> mpmc_wait_pop_until_impl(const std::shared_ptr<MpmcQueueHandle>& handle, void* payload,
+                                      uint32_t payload_size,
+                                      std::chrono::steady_clock::time_point deadline) noexcept {
+	return mpmc_wait_pop_until_impl(handle, payload, payload_size, deadline, {});
+}
+
+Result<void> mpmc_wait_push_until_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
+                                       const void* payload, uint32_t payload_size,
+                                       std::chrono::steady_clock::time_point deadline,
+                                       const CancellationToken& token) noexcept {
+	return wait_until(handle, payload, nullptr, payload_size, deadline, token, true);
+}
+
+Result<void> mpmc_wait_pop_until_impl(const std::shared_ptr<MpmcQueueHandle>& handle, void* payload,
+                                      uint32_t payload_size,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      const CancellationToken& token) noexcept {
+	return wait_until(handle, nullptr, payload, payload_size, deadline, token, false);
+}
+
+Result<void> mpmc_close_impl(const std::shared_ptr<MpmcQueueHandle>& handle) noexcept {
+	auto valid = validate_live_handle(handle, "MpmcQueue::close");
+	if (!valid) return valid.error();
+	handle->diagnostics.add(DiagnosticCounter::kCloseCalls);
+	if (!owner_matches(handle->header()->creator, handle->self)) {
+		return make_error(ErrorCode::kPermissionDenied, "MpmcQueue::close",
+		                  "creator identity required");
+	}
+	if (shared_load_acquire(&handle->header()->closed) != 0) return {};
+	auto gate = acquire_gate(handle.get(), true);
+	if (!gate) return gate.error();
+	shared_store_release(&handle->header()->closed, uint32_t{1});
+	release_gate(handle.get(), true);
+	notify_waiters(handle.get());
+	return {};
+}
+
+BatchResult mpmc_try_push_batch_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
+                                     const void* payload, uint32_t payload_size, size_t count,
+                                     const CancellationToken& token) noexcept {
+	return try_batch(handle, payload, nullptr, payload_size, count, token, true);
+}
+
+BatchResult mpmc_try_pop_batch_impl(const std::shared_ptr<MpmcQueueHandle>& handle, void* payload,
+                                    uint32_t payload_size, size_t count,
+                                    const CancellationToken& token) noexcept {
+	return try_batch(handle, nullptr, payload, payload_size, count, token, false);
+}
+
+void mpmc_set_diagnostics_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
+                               bool enabled) noexcept {
+	if (handle) handle->diagnostics.enable(enabled);
+}
+
+void mpmc_reset_diagnostics_impl(const std::shared_ptr<MpmcQueueHandle>& handle) noexcept {
+	if (handle) handle->diagnostics.reset();
+}
+
+DiagnosticsSnapshot mpmc_diagnostics_impl(const std::shared_ptr<MpmcQueueHandle>& handle) noexcept {
+	return handle ? handle->diagnostics.snapshot(mpmc_capacity_impl(handle))
+	              : DiagnosticsSnapshot{};
 }
 
 Result<void> fill_status_owner(const MpmcQueueHandle* handle, bool enqueue,
@@ -1227,6 +1377,7 @@ Result<MpmcQueueStatus> mpmc_status_impl(
 	MpmcQueueStatus status;
 	status.ready = shared_load_acquire(&header->init_state) ==
 	               static_cast<uint32_t>(MpmcInitState::kReady);
+	status.closed = shared_load_acquire(&header->closed) != 0;
 	status.abi_major = header->abi_major;
 	status.abi_minor = header->abi_minor;
 	status.capacity = header->capacity;

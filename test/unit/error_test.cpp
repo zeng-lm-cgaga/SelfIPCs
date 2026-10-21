@@ -26,8 +26,10 @@ TEST(ErrorModel, EveryCodeHasStableName) {
 
 	EXPECT_STREQ(to_string(ErrorCode::kSupervisionExhausted), "SupervisionExhausted");
 
-	for (uint32_t i = 0; i <= static_cast<uint32_t>(ErrorCode::kSupervisionExhausted); ++i) {
-		const char* name = to_string(static_cast<ErrorCode>(i));
+	EXPECT_STREQ(to_string(ErrorCode::kClosed), "Closed");
+	EXPECT_STREQ(to_string(ErrorCode::kCancelled), "Cancelled");
+	for (uint32_t index = 0; index <= static_cast<uint32_t>(ErrorCode::kCancelled); ++index) {
+		const char* name = to_string(static_cast<ErrorCode>(index));
 		EXPECT_NE(name, nullptr);
 		EXPECT_STRNE(name, "UnknownError");
 	}

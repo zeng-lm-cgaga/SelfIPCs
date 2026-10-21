@@ -22,6 +22,6 @@ class CancellationRegistration {
 	CancellationRegistration* next_{nullptr};
 };
 
-}
+}  // namespace edge_runtime::detail
 
 #endif

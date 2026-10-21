@@ -38,23 +38,23 @@ CancellationRegistration::CancellationRegistration(const CancellationToken& toke
 CancellationRegistration::~CancellationRegistration() {
 	if (!state_) return;
 	std::lock_guard<std::mutex> guard(state_->mutex);
-	if (previous_) previous_->next_ = next_;
-	else state_->first = next_;
+	if (previous_)
+		previous_->next_ = next_;
+	else
+		state_->first = next_;
 	if (next_) next_->previous_ = previous_;
 }
 
-}
+}  // namespace edge_runtime::detail
 
 namespace edge_runtime {
 
 CancellationSource::CancellationSource() : state_(std::make_shared<detail::CancellationState>()) {}
 
-bool CancellationSource::request_cancel() const noexcept {
-	return state_ && state_->cancel();
-}
+bool CancellationSource::request_cancel() const noexcept { return state_ && state_->cancel(); }
 
 bool CancellationToken::is_cancelled() const noexcept {
 	return state_ && state_->cancelled.load(std::memory_order_acquire);
 }
 
-}
+}  // namespace edge_runtime

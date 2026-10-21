@@ -40,21 +40,20 @@ constexpr const char* kErrorNames[] = {
         "ProducerStalled",
         "TransportFailed",
         "SupervisionExhausted",
-	"QueueFull",
-	"QueueEmpty",
-	"QueueContention",
-	"BufferPoolFull",
-	"BufferPoolContention",
-	"BufferInvalidHandle",
-	"BufferStateMismatch",
-	"Closed",
-	"Cancelled",
+        "QueueFull",
+        "QueueEmpty",
+        "QueueContention",
+        "BufferPoolFull",
+        "BufferPoolContention",
+        "BufferInvalidHandle",
+        "BufferStateMismatch",
+        "Closed",
+        "Cancelled",
 };
 // 错误码名称表必须与枚举保持一一对应，名称会出现在工具输出和日志中。
 static_assert(sizeof(kErrorNames) / sizeof(kErrorNames[0]) ==
-			static_cast<size_t>(ErrorCode::kCancelled) + 1u,
+                      static_cast<size_t>(ErrorCode::kCancelled) + 1u,
               "error name table must match the frozen ErrorCode enum");
-
 }
 
 Error::Error(ErrorCode c, const char* op, const char* ctx) : code(c), operation(op) {

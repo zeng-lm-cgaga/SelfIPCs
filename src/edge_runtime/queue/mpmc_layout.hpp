@@ -11,7 +11,7 @@ namespace edge_runtime::detail {
 
 inline constexpr char kMpmcHeaderMagic[] = "EDGMPMC2";
 inline constexpr char kMpmcLegacyHeaderMagic[] = "EDGMPMC1";
-inline constexpr uint16_t kMpmcAbiMajor = 2;
+inline constexpr uint16_t kMpmcAbiMajor = 3;
 inline constexpr uint16_t kMpmcAbiMinor = 0;
 inline constexpr uint16_t kMpmcAbiMinorMax = 0;
 inline constexpr uint32_t kMpmcEndianMarker = 0x01020304u;
@@ -77,7 +77,7 @@ struct alignas(64) MpmcQueueHeaderAbi {
 	alignas(4) uint32_t enqueue_lock;
 	alignas(4) uint32_t dequeue_lock;
 	alignas(4) uint32_t init_state;
-	uint32_t reserved1;
+	alignas(4) uint32_t closed;
 	MpmcOwnerAbi enqueue_owner;
 	MpmcOwnerAbi dequeue_owner;
 	uint64_t header_checksum;
@@ -99,6 +99,7 @@ static_assert(offsetof(MpmcQueueHeaderAbi, enqueue_position) == 136,
               "mpmc enqueue position offset");
 static_assert(offsetof(MpmcQueueHeaderAbi, dequeue_position) == 144,
               "mpmc dequeue position offset");
+static_assert(offsetof(MpmcQueueHeaderAbi, closed) == 164, "mpmc close offset");
 static_assert(offsetof(MpmcQueueHeaderAbi, enqueue_owner) == 168,
               "mpmc enqueue owner offset");
 static_assert(offsetof(MpmcQueueHeaderAbi, dequeue_owner) == 200,

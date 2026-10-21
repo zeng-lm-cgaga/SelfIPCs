@@ -2,11 +2,14 @@
 #define EDGE_RUNTIME_MPMC_QUEUE_HPP
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <type_traits>
 
+#include "edge_runtime/common/cancellation.hpp"
+#include "edge_runtime/common/diagnostics.hpp"
 #include "edge_runtime/common/error.hpp"
 #include "edge_runtime/common/result.hpp"
 #include "edge_runtime/common/schema.hpp"
@@ -18,8 +21,28 @@ struct MpmcQueueOptions {
 	uint32_t capacity{0};
 };
 
+inline constexpr size_t kMpmcMaxBatchSize = 256;
+
+enum class BatchStopReason : uint32_t {
+	kComplete,
+	kFull,
+	kEmpty,
+	kClosed,
+	kCancelled,
+	kContention,
+	kError,
+};
+
+struct BatchResult {
+	size_t count{0};
+	BatchStopReason reason{BatchStopReason::kComplete};
+	Error error{};
+	explicit operator bool() const noexcept { return reason == BatchStopReason::kComplete; }
+};
+
 struct MpmcQueueStatus {
 	bool ready{false};
+	bool closed{false};
 	uint16_t abi_major{0};
 	uint16_t abi_minor{0};
 	uint32_t capacity{0};
@@ -57,6 +80,25 @@ Result<void> mpmc_wait_push_until_impl(
 Result<void> mpmc_wait_pop_until_impl(
         const std::shared_ptr<MpmcQueueHandle>& handle, void* payload, uint32_t payload_size,
         std::chrono::steady_clock::time_point deadline) noexcept;
+Result<void> mpmc_wait_push_until_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
+                                       const void* payload, uint32_t payload_size,
+                                       std::chrono::steady_clock::time_point deadline,
+                                       const CancellationToken& token) noexcept;
+Result<void> mpmc_wait_pop_until_impl(const std::shared_ptr<MpmcQueueHandle>& handle, void* payload,
+                                      uint32_t payload_size,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      const CancellationToken& token) noexcept;
+Result<void> mpmc_close_impl(const std::shared_ptr<MpmcQueueHandle>& handle) noexcept;
+BatchResult mpmc_try_push_batch_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
+                                     const void* payload, uint32_t payload_size, size_t count,
+                                     const CancellationToken& token) noexcept;
+BatchResult mpmc_try_pop_batch_impl(const std::shared_ptr<MpmcQueueHandle>& handle, void* payload,
+                                    uint32_t payload_size, size_t count,
+                                    const CancellationToken& token) noexcept;
+void mpmc_set_diagnostics_impl(const std::shared_ptr<MpmcQueueHandle>& handle,
+                               bool enabled) noexcept;
+void mpmc_reset_diagnostics_impl(const std::shared_ptr<MpmcQueueHandle>& handle) noexcept;
+DiagnosticsSnapshot mpmc_diagnostics_impl(const std::shared_ptr<MpmcQueueHandle>& handle) noexcept;
 Result<MpmcQueueStatus> mpmc_status_impl(
         const std::shared_ptr<MpmcQueueHandle>& handle) noexcept;
 Result<void> mpmc_remove_if_creator_impl(
@@ -118,6 +160,41 @@ class MpmcQueue {
 
 	Result<MpmcQueueStatus> status() const noexcept {
 		return detail::mpmc_status_impl(handle_);
+	}
+
+	Result<void> wait_push_until(const T& value, std::chrono::steady_clock::time_point deadline,
+	                             const CancellationToken& token) noexcept {
+		return detail::mpmc_wait_push_until_impl(handle_, &value, sizeof(T), deadline,
+		                                         token);
+	}
+
+	Result<T> wait_pop_until(std::chrono::steady_clock::time_point deadline,
+	                         const CancellationToken& token) noexcept {
+		T value{};
+		auto result = detail::mpmc_wait_pop_until_impl(handle_, &value, sizeof(T), deadline,
+		                                               token);
+		if (!result) return result.error();
+		return Result<T>(std::move(value));
+	}
+
+	Result<void> close() noexcept { return detail::mpmc_close_impl(handle_); }
+
+	BatchResult try_push_batch(const T* values, size_t count,
+	                           const CancellationToken& token = {}) noexcept {
+		return detail::mpmc_try_push_batch_impl(handle_, values, sizeof(T), count, token);
+	}
+
+	BatchResult try_pop_batch(T* values, size_t count,
+	                          const CancellationToken& token = {}) noexcept {
+		return detail::mpmc_try_pop_batch_impl(handle_, values, sizeof(T), count, token);
+	}
+
+	void set_diagnostics_enabled(bool enabled) noexcept {
+		detail::mpmc_set_diagnostics_impl(handle_, enabled);
+	}
+	void reset_diagnostics() noexcept { detail::mpmc_reset_diagnostics_impl(handle_); }
+	DiagnosticsSnapshot diagnostics() const noexcept {
+		return detail::mpmc_diagnostics_impl(handle_);
 	}
 
 	Result<void> remove_if_creator() noexcept {

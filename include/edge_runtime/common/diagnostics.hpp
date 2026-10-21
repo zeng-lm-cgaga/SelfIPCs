@@ -26,6 +26,6 @@ struct DiagnosticsSnapshot {
 	uint64_t batch_calls{0};
 };
 
-}
+}  // namespace edge_runtime
 
 #endif
