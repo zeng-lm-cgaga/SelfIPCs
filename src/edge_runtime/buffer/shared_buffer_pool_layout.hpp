@@ -10,7 +10,7 @@ namespace edge_runtime::detail {
 
 inline constexpr char kSharedBufferPoolMagic[8] = {'E', 'R', 'B', 'P', 'O', 'O', 'L', '2'};
 inline constexpr char kSharedBufferPoolLegacyMagic[8] = {'E', 'R', 'B', 'P', 'O', 'O', 'L', '1'};
-inline constexpr uint16_t kSharedBufferPoolAbiMajor = 2;
+inline constexpr uint16_t kSharedBufferPoolAbiMajor = 3;
 inline constexpr uint16_t kSharedBufferPoolAbiMinor = 0;
 inline constexpr uint32_t kSharedBufferPoolEndianMarker = 0x01020304u;
 inline constexpr uint32_t kSharedBufferPoolMaxBlockCount = 4096;
@@ -66,7 +66,8 @@ struct alignas(64) SharedBufferPoolHeaderAbi {
 	uint32_t init_state;
 	uint64_t header_checksum;
 	BufferPoolOwnerAbi creator;
-	uint8_t reserved[24];
+	alignas(4) uint32_t notify_epoch;
+	uint8_t reserved[20];
 };
 static_assert(sizeof(SharedBufferPoolHeaderAbi) == 192, "SharedBufferPoolHeaderAbi size");
 static_assert(alignof(SharedBufferPoolHeaderAbi) == 64, "SharedBufferPoolHeaderAbi alignment");
@@ -93,6 +94,8 @@ static_assert(offsetof(SharedBufferPoolHeaderAbi, init_state) == 100,
 static_assert(offsetof(SharedBufferPoolHeaderAbi, header_checksum) == 104,
               "pool checksum");
 static_assert(offsetof(SharedBufferPoolHeaderAbi, creator) == 112, "pool creator");
+static_assert(offsetof(SharedBufferPoolHeaderAbi, notify_epoch) == 144, "pool notify epoch");
+static_assert(offsetof(SharedBufferPoolHeaderAbi, reserved) == 148, "pool reserved");
 
 struct alignas(64) SharedBufferBlockHeaderAbi {
 	uint32_t state;

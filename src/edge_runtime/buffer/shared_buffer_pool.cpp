@@ -5,11 +5,17 @@
 #include "edge_runtime/process/process_identity.hpp"
 #include "edge_runtime/utility/random.hpp"
 #include "edge_runtime/utility/failpoint.hpp"
+#include "edge_runtime/utility/local_diagnostics.hpp"
+#include "edge_runtime/sync/cancellation.hpp"
+#include "edge_runtime/sync/futex.hpp"
 #include "edge_runtime/sync/shared_atomic.hpp"
 #include "edge_runtime/sync/owner_snapshot.hpp"
 #include "edge_runtime/buffer/shared_buffer_pool_layout.hpp"
 #include "edge_runtime/transport/shm_object.hpp"
 
+#include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cstring>
 
 #include <unistd.h>
@@ -22,6 +28,7 @@ struct SharedBufferPoolHandle {
 	ProcessIdentity self;
 	bool created{false};
 	bool removed{false};
+	LocalDiagnostics diagnostics;
 
 	SharedBufferPoolHeaderAbi* header() noexcept {
 		return static_cast<SharedBufferPoolHeaderAbi*>(object.mapping.get());
@@ -89,10 +96,22 @@ OwnerObservation snapshot_block_owner(const SharedBufferBlockHeaderAbi* block) n
 }
 
 uint64_t header_checksum(const SharedBufferPoolHeaderAbi* header) noexcept {
-	SharedBufferPoolHeaderAbi copy = *header;
-	copy.init_state = 0;
-	copy.header_checksum = 0;
+	SharedBufferPoolHeaderAbi copy{};
+	auto* destination = reinterpret_cast<std::byte*>(&copy);
+	const auto* source = reinterpret_cast<const std::byte*>(header);
+	std::memcpy(destination, source, offsetof(SharedBufferPoolHeaderAbi, init_state));
+	std::memcpy(&copy.creator, &header->creator, sizeof(copy.creator));
+	constexpr size_t reserved_offset = offsetof(SharedBufferPoolHeaderAbi, reserved);
+	std::memcpy(destination + reserved_offset, source + reserved_offset,
+	            sizeof(copy) - reserved_offset);
 	return fnv1a64(reinterpret_cast<const std::byte*>(&copy), sizeof(copy));
+}
+
+void publish_free(SharedBufferPoolHandle* handle, SharedBufferBlockHeaderAbi* block) noexcept {
+	shared_store_seq_cst(&block->state, static_cast<uint32_t>(SharedBufferBlockState::kFree));
+	__atomic_fetch_add(&handle->header()->notify_epoch, uint32_t{1}, __ATOMIC_RELEASE);
+	handle->diagnostics.add(DiagnosticCounter::kNotifications);
+	(void)futex_wake(&handle->header()->notify_epoch, INT_MAX);
 }
 
 bool same_schema(const SharedBufferPoolHeaderAbi* header,
@@ -239,6 +258,10 @@ Result<void> validate_live_pool(const std::shared_ptr<SharedBufferPoolHandle>& h
                                 const char* operation) noexcept {
 	if (!handle || handle->removed || handle->object.mapping.get() == nullptr) {
 		return make_error(ErrorCode::kStaleHandle, operation, "pool handle is stale");
+	}
+	if (static_cast<uint64_t>(::getpid()) != handle->self.pid) {
+		return make_error(ErrorCode::kRecoveryBlocked, operation,
+		                  "pool handle inherited across fork; reopen in this process");
 	}
 	if (shared_load_acquire(&handle->header()->init_state) !=
 	    static_cast<uint32_t>(SharedBufferPoolInitState::kReady)) {
@@ -476,111 +499,201 @@ Result<std::shared_ptr<SharedBufferPoolHandle>> shared_buffer_pool_open_impl(
 
 Result<WriteBuffer> shared_buffer_pool_try_acquire_write_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
-	auto valid = validate_live_pool(handle, "SharedBufferPool::try_acquire_write");
-	if (!valid) return valid.error();
-	bool saw_contention = false;
-	bool saw_recovery = false;
-	bool saw_exhausted = false;
-	const auto* header = handle->header();
-	for (uint32_t block_id = 0; block_id < header->block_count; ++block_id) {
-		auto* block = block_at(handle.get(), block_id);
-		if (block == nullptr) {
-			return make_error(ErrorCode::kCorruptSlot,
-			                  "SharedBufferPool::try_acquire_write", "block offset invalid");
-		}
-		const uint32_t state = shared_load_seq_cst(&block->state);
-		if (state == static_cast<uint32_t>(SharedBufferBlockState::kPublished)) continue;
-		if (state != static_cast<uint32_t>(SharedBufferBlockState::kFree)) {
-			if (state == static_cast<uint32_t>(SharedBufferBlockState::kEpochExhausted)) {
+	if (handle) handle->diagnostics.add(DiagnosticCounter::kAcquireAttempts);
+	const auto acquire_once = [&handle]() noexcept -> Result<WriteBuffer> {
+		auto valid = validate_live_pool(handle, "SharedBufferPool::try_acquire_write");
+		if (!valid) return valid.error();
+		bool saw_contention = false;
+		bool saw_recovery = false;
+		bool saw_exhausted = false;
+		const auto* header = handle->header();
+		for (uint32_t block_id = 0; block_id < header->block_count; ++block_id) {
+			auto* block = block_at(handle.get(), block_id);
+			if (block == nullptr) {
+				return make_error(ErrorCode::kCorruptSlot,
+				                  "SharedBufferPool::try_acquire_write",
+				                  "block offset invalid");
+			}
+			const uint32_t state = shared_load_seq_cst(&block->state);
+			if (state == static_cast<uint32_t>(SharedBufferBlockState::kPublished))
+				continue;
+			if (state != static_cast<uint32_t>(SharedBufferBlockState::kFree)) {
+				if (state == static_cast<uint32_t>(
+				                     SharedBufferBlockState::kEpochExhausted)) {
+					saw_exhausted = true;
+					continue;
+				}
+				auto busy = classify_active_block(
+				        handle.get(), block, state,
+				        "SharedBufferPool::try_acquire_write");
+				if (busy.error().code == ErrorCode::kRecoveryBlocked)
+					saw_recovery = true;
+				if (busy.error().code == ErrorCode::kBufferPoolContention ||
+				    busy.error().code == ErrorCode::kConcurrentHandleUse) {
+					saw_contention = true;
+				}
+				continue;
+			}
+			if (!shared_cas_seq_cst(
+			            &block->state,
+			            static_cast<uint32_t>(SharedBufferBlockState::kFree),
+			            static_cast<uint32_t>(
+			                    SharedBufferBlockState::kWritingClaiming))) {
+				saw_contention = true;
+				continue;
+			}
+			const uint64_t previous_generation =
+			        shared_load_seq_cst(&block->block_generation);
+			if (previous_generation == UINT64_MAX) {
+				publish_free(handle.get(), block);
 				saw_exhausted = true;
 				continue;
 			}
-			auto busy = classify_active_block(handle.get(), block, state,
-			                                  "SharedBufferPool::try_acquire_write");
-			if (busy.error().code == ErrorCode::kRecoveryBlocked) saw_recovery = true;
-			if (busy.error().code == ErrorCode::kBufferPoolContention ||
-			    busy.error().code == ErrorCode::kConcurrentHandleUse) {
-				saw_contention = true;
+			const OwnerCommitResult epoch_capacity =
+			        owner_epoch_capacity(&block->owner_epoch, 4u);
+			if (epoch_capacity != OwnerCommitResult::kReady) {
+				shared_store_seq_cst(
+				        &block->state,
+				        epoch_capacity == OwnerCommitResult::kEpochExhausted
+				                ? static_cast<uint32_t>(
+				                          SharedBufferBlockState::kEpochExhausted)
+				                : static_cast<uint32_t>(
+				                          SharedBufferBlockState::
+				                                  kOwnerProtocolFault));
+				if (epoch_capacity == OwnerCommitResult::kEpochExhausted) {
+					saw_exhausted = true;
+				} else {
+					saw_recovery = true;
+				}
+				continue;
 			}
-			continue;
-		}
-		if (!shared_cas_seq_cst(&block->state,
-		                       static_cast<uint32_t>(SharedBufferBlockState::kFree),
-		                       static_cast<uint32_t>(SharedBufferBlockState::kWritingClaiming))) {
-			saw_contention = true;
-			continue;
-		}
-		const uint64_t previous_generation = shared_load_seq_cst(&block->block_generation);
-		if (previous_generation == UINT64_MAX) {
-			shared_store_seq_cst(&block->state,
-			                     static_cast<uint32_t>(SharedBufferBlockState::kFree));
-			saw_exhausted = true;
-			continue;
-		}
-		const OwnerCommitResult epoch_capacity = owner_epoch_capacity(&block->owner_epoch, 4u);
-		if (epoch_capacity != OwnerCommitResult::kReady) {
+			uint64_t committed_epoch = 0;
+			const OwnerCommitResult owner_commit =
+			        begin_owner_commit(&block->owner_epoch, 4u, &committed_epoch);
+			if (owner_commit != OwnerCommitResult::kReady) {
+				shared_store_seq_cst(
+				        &block->state,
+				        owner_commit == OwnerCommitResult::kEpochExhausted
+				                ? static_cast<uint32_t>(
+				                          SharedBufferBlockState::kEpochExhausted)
+				                : static_cast<uint32_t>(
+				                          SharedBufferBlockState::
+				                                  kOwnerProtocolFault));
+				if (owner_commit == OwnerCommitResult::kEpochExhausted) {
+					saw_exhausted = true;
+				} else {
+					saw_recovery = true;
+				}
+				continue;
+			}
+			EDGE_FAILPOINT(SHARED_BUFFER_POOL_WRITE_OWNER_EPOCH_ODD);
+			shared_store_seq_cst(&block->block_generation, previous_generation + 1);
+			set_owner(&block->owner, handle->self);
+			shared_store_seq_cst(&block->owner_epoch, committed_epoch);
+			EDGE_FAILPOINT(SHARED_BUFFER_POOL_WRITE_OWNER_EPOCH_COMMITTED);
 			shared_store_seq_cst(
 			        &block->state,
-			        epoch_capacity == OwnerCommitResult::kEpochExhausted
-			                ? static_cast<uint32_t>(SharedBufferBlockState::kEpochExhausted)
-			                : static_cast<uint32_t>(SharedBufferBlockState::kOwnerProtocolFault));
-			if (epoch_capacity == OwnerCommitResult::kEpochExhausted) {
-				saw_exhausted = true;
-			} else {
-				saw_recovery = true;
+			        static_cast<uint32_t>(SharedBufferBlockState::kWriting));
+			auto* payload = payload_at(handle.get(), block_id);
+			if (payload == nullptr) {
+				publish_free(handle.get(), block);
+				return make_error(ErrorCode::kCorruptSlot,
+				                  "SharedBufferPool::try_acquire_write",
+				                  "payload offset invalid");
 			}
-			continue;
+			const BufferHandle descriptor = make_handle(handle.get(), block_id, block);
+			return Result<WriteBuffer>(WriteBuffer(handle, block, payload,
+			                                       header->block_size, descriptor));
 		}
-		uint64_t committed_epoch = 0;
-		const OwnerCommitResult owner_commit =
-		        begin_owner_commit(&block->owner_epoch, 4u, &committed_epoch);
-		if (owner_commit != OwnerCommitResult::kReady) {
-			shared_store_seq_cst(
-			        &block->state,
-			        owner_commit == OwnerCommitResult::kEpochExhausted
-			                ? static_cast<uint32_t>(SharedBufferBlockState::kEpochExhausted)
-			                : static_cast<uint32_t>(SharedBufferBlockState::kOwnerProtocolFault));
-			if (owner_commit == OwnerCommitResult::kEpochExhausted) {
-				saw_exhausted = true;
-			} else {
-				saw_recovery = true;
-			}
-			continue;
-		}
-		EDGE_FAILPOINT(SHARED_BUFFER_POOL_WRITE_OWNER_EPOCH_ODD);
-		shared_store_seq_cst(&block->block_generation, previous_generation + 1);
-		set_owner(&block->owner, handle->self);
-		shared_store_seq_cst(&block->owner_epoch, committed_epoch);
-		EDGE_FAILPOINT(SHARED_BUFFER_POOL_WRITE_OWNER_EPOCH_COMMITTED);
-		shared_store_seq_cst(&block->state,
-		                     static_cast<uint32_t>(SharedBufferBlockState::kWriting));
-		auto* payload = payload_at(handle.get(), block_id);
-		if (payload == nullptr) {
-			shared_store_seq_cst(&block->state,
-			                     static_cast<uint32_t>(SharedBufferBlockState::kFree));
-			return make_error(ErrorCode::kCorruptSlot,
+		if (saw_recovery) {
+			return make_error(ErrorCode::kRecoveryBlocked,
 			                  "SharedBufferPool::try_acquire_write",
-			                  "payload offset invalid");
+			                  "an active block owner is dead or unverifiable");
 		}
-		const BufferHandle descriptor = make_handle(handle.get(), block_id, block);
-		return Result<WriteBuffer>(
-		        WriteBuffer(handle, block, payload, header->block_size, descriptor));
+		if (saw_exhausted) {
+			return make_error(
+			        ErrorCode::kSequenceExhausted,
+			        "SharedBufferPool::try_acquire_write",
+			        "all writable blocks exhausted their owner or generation epochs");
+		}
+		if (saw_contention) {
+			return make_error(ErrorCode::kBufferPoolContention,
+			                  "SharedBufferPool::try_acquire_write",
+			                  "all writable blocks are actively owned");
+		}
+		return make_error(ErrorCode::kBufferPoolFull, "SharedBufferPool::try_acquire_write",
+		                  "all blocks are published or unavailable");
+	};
+	auto result = acquire_once();
+	if (handle) {
+		if (result)
+			handle->diagnostics.add(DiagnosticCounter::kAcquireSuccesses);
+		else
+			handle->diagnostics.record_error(result.error().code);
 	}
-	if (saw_recovery) {
-		return make_error(ErrorCode::kRecoveryBlocked, "SharedBufferPool::try_acquire_write",
-		                  "an active block owner is dead or unverifiable");
+	return result;
+}
+
+Result<WriteBuffer> shared_buffer_pool_wait_acquire_write_until_impl(
+        const std::shared_ptr<SharedBufferPoolHandle>& handle,
+        std::chrono::steady_clock::time_point deadline, const CancellationToken& token) noexcept {
+	if (handle) handle->diagnostics.add(DiagnosticCounter::kWaitCalls);
+	auto valid = validate_live_pool(handle, "SharedBufferPool::wait_acquire_write_until");
+	if (!valid) return valid.error();
+	auto* epoch = &handle->header()->notify_epoch;
+	CancellationRegistration registration(token, epoch);
+	for (;;) {
+		const uint32_t expected = shared_load_acquire(epoch);
+		auto result = shared_buffer_pool_try_acquire_write_impl(handle);
+		if (result || (result.error().code != ErrorCode::kBufferPoolFull &&
+		               result.error().code != ErrorCode::kBufferPoolContention)) {
+			return result;
+		}
+		if (token.is_cancelled()) {
+			handle->diagnostics.add(DiagnosticCounter::kCancelled);
+			return make_error(ErrorCode::kCancelled,
+			                  "SharedBufferPool::wait_acquire_write_until",
+			                  "write acquisition cancelled");
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			handle->diagnostics.add(DiagnosticCounter::kTimeouts);
+			return make_error(ErrorCode::kTimeout,
+			                  "SharedBufferPool::wait_acquire_write_until",
+			                  "write acquisition deadline expired");
+		}
+		const std::chrono::steady_clock::duration max_slice = std::chrono::milliseconds(10);
+		const auto slice = std::min(deadline - now, max_slice);
+		const auto nanoseconds =
+		        std::chrono::duration_cast<std::chrono::nanoseconds>(slice);
+		const timespec relative{0, static_cast<long>(nanoseconds.count())};
+		handle->diagnostics.add(DiagnosticCounter::kWaits);
+		if (futex_wait(epoch, expected, &relative) < 0) {
+			const int saved_errno = errno;
+			if (saved_errno != EAGAIN && saved_errno != EINTR &&
+			    saved_errno != ETIMEDOUT) {
+				return make_errno_error(
+				        saved_errno, "SharedBufferPool::wait_acquire_write_until",
+				        "futex wait failed");
+			}
+		}
 	}
-	if (saw_exhausted) {
-		return make_error(ErrorCode::kSequenceExhausted, "SharedBufferPool::try_acquire_write",
-		                  "all writable blocks exhausted their owner or generation epochs");
-	}
-	if (saw_contention) {
-		return make_error(ErrorCode::kBufferPoolContention,
-		                  "SharedBufferPool::try_acquire_write",
-		                  "all writable blocks are actively owned");
-	}
-	return make_error(ErrorCode::kBufferPoolFull, "SharedBufferPool::try_acquire_write",
-	                  "all blocks are published or unavailable");
+}
+
+void shared_buffer_pool_set_diagnostics_enabled_impl(
+        const std::shared_ptr<SharedBufferPoolHandle>& handle, bool enabled) noexcept {
+	if (handle) handle->diagnostics.enable(enabled);
+}
+
+void shared_buffer_pool_reset_diagnostics_impl(
+        const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	if (handle) handle->diagnostics.reset();
+}
+
+DiagnosticsSnapshot shared_buffer_pool_diagnostics_impl(
+        const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	if (!handle) return {};
+	return handle->diagnostics.snapshot(shared_buffer_pool_block_count_impl(handle));
 }
 
 Result<BufferHandle> shared_buffer_pool_publish_write_impl(WriteBuffer* buffer) noexcept {
@@ -624,7 +737,8 @@ Result<BufferHandle> shared_buffer_pool_publish_write_impl(WriteBuffer* buffer) 
 
 void shared_buffer_pool_abort_write_impl(WriteBuffer* buffer) noexcept {
 	if (buffer == nullptr || !buffer->active_) return;
-	if (buffer->pool_ && buffer->block_ != nullptr && !buffer->pool_->removed) {
+	if (buffer->pool_ && buffer->block_ != nullptr && !buffer->pool_->removed &&
+	    static_cast<uint64_t>(::getpid()) == buffer->pool_->self.pid) {
 		auto* block = static_cast<SharedBufferBlockHeaderAbi*>(buffer->block_);
 		const OwnerObservation observation = snapshot_block_owner(block);
 		if (observation.kind == OwnerSnapshotKind::kStable &&
@@ -632,8 +746,7 @@ void shared_buffer_pool_abort_write_impl(WriteBuffer* buffer) noexcept {
 		    owner_matches(observation.owner, buffer->pool_->self) &&
 		    shared_load_seq_cst(&block->block_generation) ==
 		            buffer->descriptor_.block_generation) {
-			shared_store_seq_cst(&block->state,
-			                     static_cast<uint32_t>(SharedBufferBlockState::kFree));
+			publish_free(buffer->pool_.get(), block);
 		}
 	}
 	buffer->active_ = false;
@@ -734,7 +847,8 @@ Result<ReadBuffer> shared_buffer_pool_acquire_read_impl(
 
 void shared_buffer_pool_release_read_impl(ReadBuffer* buffer) noexcept {
 	if (buffer == nullptr || !buffer->active_) return;
-	if (buffer->pool_ && buffer->block_ != nullptr && !buffer->pool_->removed) {
+	if (buffer->pool_ && buffer->block_ != nullptr && !buffer->pool_->removed &&
+	    static_cast<uint64_t>(::getpid()) == buffer->pool_->self.pid) {
 		auto* block = static_cast<SharedBufferBlockHeaderAbi*>(buffer->block_);
 		const OwnerObservation observation = snapshot_block_owner(block);
 		if (observation.kind == OwnerSnapshotKind::kStable &&
@@ -742,8 +856,7 @@ void shared_buffer_pool_release_read_impl(ReadBuffer* buffer) noexcept {
 		    owner_matches(observation.owner, buffer->pool_->self) &&
 		    shared_load_seq_cst(&block->block_generation) ==
 		            buffer->descriptor_.block_generation) {
-			shared_store_seq_cst(&block->state,
-			                     static_cast<uint32_t>(SharedBufferBlockState::kFree));
+			publish_free(buffer->pool_.get(), block);
 		}
 	}
 	buffer->active_ = false;

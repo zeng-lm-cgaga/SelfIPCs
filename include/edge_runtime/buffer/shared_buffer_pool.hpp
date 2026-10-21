@@ -1,12 +1,15 @@
 #ifndef EDGE_RUNTIME_SHARED_BUFFER_POOL_HPP
 #define EDGE_RUNTIME_SHARED_BUFFER_POOL_HPP
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <type_traits>
 
+#include "edge_runtime/common/cancellation.hpp"
+#include "edge_runtime/common/diagnostics.hpp"
 #include "edge_runtime/common/result.hpp"
 #include "edge_runtime/common/schema.hpp"
 
@@ -86,6 +89,15 @@ class WriteBufferAccess;
 class ReadBufferAccess;
 
 Result<WriteBuffer> shared_buffer_pool_try_acquire_write_impl(
+        const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept;
+Result<WriteBuffer> shared_buffer_pool_wait_acquire_write_until_impl(
+        const std::shared_ptr<SharedBufferPoolHandle>& handle,
+        std::chrono::steady_clock::time_point deadline, const CancellationToken& token) noexcept;
+void shared_buffer_pool_set_diagnostics_enabled_impl(
+        const std::shared_ptr<SharedBufferPoolHandle>& handle, bool enabled) noexcept;
+void shared_buffer_pool_reset_diagnostics_impl(
+        const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept;
+DiagnosticsSnapshot shared_buffer_pool_diagnostics_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept;
 Result<BufferHandle> shared_buffer_pool_publish_write_impl(WriteBuffer* buffer) noexcept;
 void shared_buffer_pool_abort_write_impl(WriteBuffer* buffer) noexcept;
@@ -177,6 +189,24 @@ class SharedBufferPool {
 
 	Result<WriteBuffer> try_acquire_write() noexcept {
 		return detail::shared_buffer_pool_try_acquire_write_impl(handle_);
+	}
+
+	Result<WriteBuffer> wait_acquire_write_until(std::chrono::steady_clock::time_point deadline,
+	                                             const CancellationToken& token = {}) noexcept {
+		return detail::shared_buffer_pool_wait_acquire_write_until_impl(handle_, deadline,
+		                                                                token);
+	}
+
+	void set_diagnostics_enabled(bool enabled) noexcept {
+		detail::shared_buffer_pool_set_diagnostics_enabled_impl(handle_, enabled);
+	}
+
+	void reset_diagnostics() noexcept {
+		detail::shared_buffer_pool_reset_diagnostics_impl(handle_);
+	}
+
+	DiagnosticsSnapshot diagnostics() const noexcept {
+		return detail::shared_buffer_pool_diagnostics_impl(handle_);
 	}
 
 	Result<ReadBuffer> acquire_read(const BufferHandle& descriptor) noexcept {
