@@ -52,6 +52,8 @@ enum class ErrorCode : uint32_t {
 	kBufferPoolContention,
 	kBufferInvalidHandle,
 	kBufferStateMismatch,
+	kClosed,
+	kCancelled,
 };
 
 // 固定大小错误载荷，热路径不分配内存也不抛异常。

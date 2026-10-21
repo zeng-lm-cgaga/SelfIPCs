@@ -47,10 +47,12 @@ constexpr const char* kErrorNames[] = {
 	"BufferPoolContention",
 	"BufferInvalidHandle",
 	"BufferStateMismatch",
+	"Closed",
+	"Cancelled",
 };
 // 错误码名称表必须与枚举保持一一对应，名称会出现在工具输出和日志中。
 static_assert(sizeof(kErrorNames) / sizeof(kErrorNames[0]) ==
-			static_cast<size_t>(ErrorCode::kBufferStateMismatch) + 1u,
+			static_cast<size_t>(ErrorCode::kCancelled) + 1u,
               "error name table must match the frozen ErrorCode enum");
 
 }
@@ -70,7 +72,7 @@ Error::Error(ErrorCode c, int saved_errno, const char* op, const char* ctx)
 
 const char* to_string(ErrorCode code) noexcept {
 	const uint32_t index = static_cast<uint32_t>(code);
-	if (index > static_cast<uint32_t>(ErrorCode::kBufferStateMismatch)) return "UnknownError";
+	if (index > static_cast<uint32_t>(ErrorCode::kCancelled)) return "UnknownError";
 	return kErrorNames[index];
 }
 

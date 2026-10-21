@@ -19,6 +19,7 @@ add_library(self_ipcs STATIC
   edge_runtime/transport/shm_object.cpp
   edge_runtime/sync/clock.cpp
   edge_runtime/sync/futex.cpp
+  edge_runtime/sync/cancellation.cpp
   edge_runtime/utility/checksum.cpp
   edge_runtime/utility/failpoint.cpp)
 add_library(SelfIPCs::self_ipcs ALIAS self_ipcs)
