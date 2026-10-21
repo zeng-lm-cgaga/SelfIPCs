@@ -23,10 +23,11 @@ class ConsumerState {
 	using Clock = std::chrono::steady_clock;
 	using Read = std::function<Result<void>()>;
 	using Status = std::function<Result<ChannelStatus>()>;
+	using Close = std::function<void()>;
 
 	static Result<std::shared_ptr<ConsumerState>> create(
 	        boost::asio::any_io_executor executor, std::shared_ptr<void> consumer_owner,
-	        EventNotification notification);
+	        EventNotification notification, Close release_consumer);
 
 	~ConsumerState();
 	ConsumerState(const ConsumerState&) = delete;
@@ -51,9 +52,6 @@ class Consumer {
 	using value_type = T;
 	using Clock = std::chrono::steady_clock;
 
-	// Registers event notifications synchronously, within registration_timeout;
-	// call before running the event loop. The returned wrapper owns both handles.
-	// After registration succeeds the input may be moved-from even on failure.
 	static Result<Consumer> create(
 	        boost::asio::any_io_executor executor, edge_runtime::Consumer<T>&& consumer,
 	        std::chrono::milliseconds registration_timeout = std::chrono::milliseconds{1000}) {
@@ -66,7 +64,8 @@ class Consumer {
 		try {
 			auto source = std::make_shared<Source>(std::move(consumer));
 			auto state = detail::ConsumerState::create(
-			        std::move(executor), source, std::move(registered.value()));
+			        std::move(executor), source, std::move(registered.value()),
+			        [source] { source->consumer.reset(); });
 			if (!state) return state.error();
 			return Consumer(std::move(source), std::move(state.value()));
 		} catch (const std::bad_alloc&) {
@@ -104,7 +103,7 @@ class Consumer {
        private:
 	struct Source {
 		explicit Source(edge_runtime::Consumer<T>&& input) : consumer(std::move(input)) {}
-		edge_runtime::Consumer<T> consumer;
+		std::optional<edge_runtime::Consumer<T>> consumer;
 	};
 
 	Consumer(std::shared_ptr<Source> source, std::shared_ptr<detail::ConsumerState> state)
@@ -119,12 +118,20 @@ class Consumer {
 		}
 		auto sample = std::make_shared<std::optional<Sample<T>>>();
 		auto read = [source, sample]() -> Result<void> {
-			auto latest = source->consumer.try_read_latest();
+			if (!source->consumer) {
+				return make_error(ErrorCode::kStaleHandle, "async::Consumer::read", "closed source");
+			}
+			auto latest = source->consumer->try_read_latest();
 			if (!latest) return latest.error();
 			sample->emplace(std::move(latest.value()));
 			return {};
 		};
-		auto status = [source]() { return source->consumer.status(); };
+		auto status = [source]() -> Result<ChannelStatus> {
+			if (!source->consumer) {
+				return make_error(ErrorCode::kStaleHandle, "async::Consumer::status", "closed source");
+			}
+			return source->consumer->status();
+		};
 		auto result = co_await state->wait_latest(absolute_deadline, std::move(read),
 		                                        std::move(status));
 		if (!result) co_return result.error();

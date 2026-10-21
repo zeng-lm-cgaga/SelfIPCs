@@ -56,8 +56,9 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 	};
 
 	Impl(boost::asio::any_io_executor executor, std::shared_ptr<void> owner,
-	     EventNotification registered)
-	    : consumer_owner(std::move(owner)), notification(std::move(registered)),
+	     EventNotification registered, Close release_callback)
+	    : consumer_owner(std::move(owner)), release_consumer(std::move(release_callback)),
+	      notification(std::move(registered)),
 	      strand(boost::asio::make_strand(std::move(executor))), descriptor(strand), timer(strand) {}
 
 	bool current(const std::shared_ptr<Operation>& operation) const {
@@ -68,6 +69,10 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 		boost::system::error_code ignored;
 		descriptor.close(ignored);
 		notification.reset();
+		if (release_consumer) {
+			release_consumer();
+			release_consumer = {};
+		}
 		consumer_owner.reset();
 	}
 
@@ -271,6 +276,7 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 	}
 
 	std::shared_ptr<void> consumer_owner;
+	Close release_consumer;
 	std::optional<EventNotification> notification;
 	boost::asio::strand<boost::asio::any_io_executor> strand;
 	boost::asio::posix::stream_descriptor descriptor;
@@ -290,14 +296,14 @@ ConsumerState::~ConsumerState() = default;
 
 Result<std::shared_ptr<ConsumerState>> ConsumerState::create(
         boost::asio::any_io_executor executor, std::shared_ptr<void> consumer_owner,
-        EventNotification notification) {
+        EventNotification notification, Close release_consumer) {
 	if (!executor || !consumer_owner || notification.native_handle() < 0) {
 		return make_error(ErrorCode::kInvalidOptions, "async::Consumer::create",
 		                  "invalid executor or notification owner");
 	}
 	try {
 		auto impl = std::make_shared<Impl>(std::move(executor), std::move(consumer_owner),
-		                                   std::move(notification));
+		                                   std::move(notification), std::move(release_consumer));
 		const int duplicate = ::fcntl(impl->notification->native_handle(), F_DUPFD_CLOEXEC, 0);
 		if (duplicate < 0) {
 			return make_errno_error(ErrorCode::kSystemError, errno, "async::Consumer::create",
