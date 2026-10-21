@@ -5,4 +5,13 @@ find_dependency(Threads)
 
 include("${CMAKE_CURRENT_LIST_DIR}/SelfIPCsTargets.cmake")
 
+set(SelfIPCs_async_FOUND FALSE)
+if("async" IN_LIST SelfIPCs_FIND_COMPONENTS)
+  if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/SelfIPCsAsyncTargets.cmake")
+    find_dependency(Boost 1.74 COMPONENTS system)
+    include("${CMAKE_CURRENT_LIST_DIR}/SelfIPCsAsyncTargets.cmake")
+    set(SelfIPCs_async_FOUND TRUE)
+  endif()
+endif()
+
 check_required_components(SelfIPCs)

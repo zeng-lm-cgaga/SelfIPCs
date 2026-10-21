@@ -20,7 +20,7 @@ from self_ipcs_compat import validate_release_cache
 
 VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 COMMIT = re.compile(r"[0-9a-f]{40}")
-SOURCE_DIRS = {".github", "cmake", "examples", "include", "scripts", "src", "test", "tools"}
+SOURCE_DIRS = {".github", "async", "cmake", "examples", "include", "kernel", "scripts", "src", "test", "tools"}
 SOURCE_FILES = {".clang-format", ".editorconfig", ".gitignore", "CMakeLists.txt",
                 "CMakePresets.json", "README.md", "LICENSE", "LICENSE.txt"}
 

@@ -51,6 +51,7 @@ endfunction()
 
 selfipcs_option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 selfipcs_option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+selfipcs_option(BUILD_ASYNC "Build the optional C++20 Boost.Asio consumer component" OFF)
 
 set(_selfipcs_failpoints_default OFF)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -86,6 +87,9 @@ function(edgeruntime_apply_project_options target)
 endfunction()
 
 add_subdirectory(src)
+if(SELFIPCS_BUILD_ASYNC)
+  add_subdirectory(async)
+endif()
 add_subdirectory(tools)
 if(BUILD_TESTING)
   add_subdirectory(test)

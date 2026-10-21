@@ -98,10 +98,13 @@ class ReleaseTest(ReleaseFixture, unittest.TestCase):
 
     def test_nested_private_documents_refused(self):
         for name in ("docs/design.md", "scripts/AGENTS.md", "src/design.md", "evidence/log.txt",
+                     "async/CLAUDE.md", "kernel/notification/design.md",
                      "src/../../secret", "/etc/passwd", "src\\escape.cpp"):
             with self.subTest(name=name):
                 self.assertFalse(release.public_source_path(name))
-        for name in ("README.md", "src/channel.cpp", "scripts/run.py", ".github/workflows/ci.yml"):
+        for name in ("README.md", "src/channel.cpp", "scripts/run.py", ".github/workflows/ci.yml",
+                     "async/include/self_ipcs/async/consumer.hpp",
+                     "kernel/notification/include/uapi/self_ipcs_notification.h"):
             self.assertTrue(release.public_source_path(name))
 
     def test_output_directory_never_overwritten(self):
