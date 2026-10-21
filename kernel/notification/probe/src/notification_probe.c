@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -230,6 +231,8 @@ int notification_probe_run(const char* device) {
 	int original = -1;
 	int duplicate = -1;
 	int independent = -1;
+	int poller = -1;
+	struct epoll_event event = {.events = EPOLLIN, .data.u64 = 1};
 	int control[2] = {-1, -1};
 	pid_t child = -1;
 	void* fault_page = MAP_FAILED;
@@ -259,6 +262,9 @@ int notification_probe_run(const char* device) {
 	REQUIRE(independent >= 0);
 	duplicate = fcntl(original, F_DUPFD_CLOEXEC, 0);
 	REQUIRE(duplicate >= 0);
+	poller = epoll_create1(EPOLL_CLOEXEC);
+	REQUIRE(poller >= 0);
+	REQUIRE(epoll_ctl(poller, EPOLL_CTL_ADD, duplicate, &event) == 0);
 	REQUIRE(read(original, &counter, sizeof(counter)) == -1 && errno == EAGAIN);
 	REQUIRE(read(original, invalid_size, 7) == -1 && errno == EINVAL);
 	REQUIRE(write(original, invalid_size, 9) == -1 && errno == EINVAL);
@@ -269,7 +275,9 @@ int notification_probe_run(const char* device) {
 	REQUIRE(write(duplicate, &counter, sizeof(counter)) == sizeof(counter));
 	counter = 3;
 	REQUIRE(write(original, &counter, sizeof(counter)) == sizeof(counter));
+	REQUIRE(epoll_wait(poller, &event, 1, 2000) == 1 && event.events == EPOLLIN);
 	REQUIRE(read(duplicate, &counter, sizeof(counter)) == sizeof(counter) && counter == 5);
+	REQUIRE(epoll_wait(poller, &event, 1, 0) == 0);
 	REQUIRE(read(independent, &counter, sizeof(counter)) == -1 && errno == EAGAIN);
 	counter = UINT64_MAX;
 	REQUIRE(write(original, &counter, sizeof(counter)) == sizeof(counter));
@@ -320,11 +328,16 @@ int notification_probe_run(const char* device) {
 	REQUIRE(write(duplicate, &counter, sizeof(counter)) == sizeof(counter));
 	REQUIRE(request(control[0], PEER_STOP, 0, 0, 0) == 0);
 	REQUIRE(wait_for(duplicate, POLLIN | POLLOUT, 0) == POLLIN);
+	REQUIRE(epoll_wait(poller, &event, 1, 2000) == 1 && event.events == EPOLLIN);
 	REQUIRE(write(duplicate, &counter, sizeof(counter)) == -1 && errno == EPIPE);
 	REQUIRE(ioctl(duplicate, SELF_IPCS_NOTIFICATION_STOP, 0UL) == 0);
 	REQUIRE(read(duplicate, &counter, sizeof(counter)) == sizeof(counter) && counter == 9);
 	REQUIRE(wait_for(duplicate, POLLIN | POLLOUT, 0) == POLLHUP);
+	REQUIRE(epoll_wait(poller, &event, 1, 2000) == 1 && event.events == EPOLLHUP);
 	REQUIRE(read(duplicate, &counter, sizeof(counter)) == 0);
+	REQUIRE(epoll_ctl(poller, EPOLL_CTL_DEL, duplicate, NULL) == 0);
+	close(poller);
+	poller = -1;
 	close(duplicate);
 	duplicate = -1;
 	REQUIRE(request(control[0], PEER_READ, 0, 0, 0) == 0);
@@ -361,7 +374,7 @@ int notification_probe_run(const char* device) {
 		REQUIRE(peer_result == 0);
 	}
 	outcome = 0;
-	puts("PASS device: dup/SCM_RIGHTS exec, isolation, EFAULT, overflow, EINTR, poll, sticky "
+	puts("PASS device: dup/SCM_RIGHTS exec, isolation, EFAULT, overflow, EINTR, poll/epoll, sticky "
 	     "stop/EOF");
 cleanup:
 	if (child > 0) {
@@ -370,6 +383,10 @@ cleanup:
 	}
 	if (signal_installed) (void)sigaction(SIGUSR1, &old_action, NULL);
 	if (fault_page != MAP_FAILED) (void)munmap(fault_page, (size_t)page_bytes);
+	if (poller >= 0) {
+		if (duplicate >= 0) (void)epoll_ctl(poller, EPOLL_CTL_DEL, duplicate, NULL);
+		close(poller);
+	}
 	if (original >= 0) close(original);
 	if (duplicate >= 0) close(duplicate);
 	if (independent >= 0) close(independent);
