@@ -1,0 +1,3 @@
+obj-m += self_ipcs_notification.o
+self_ipcs_notification-y := src/self_ipcs_notification.o
+ccflags-y += -I$(src)/include/uapi
