@@ -95,6 +95,29 @@ OwnerObservation snapshot_block_owner(const SharedBufferBlockHeaderAbi* block) n
 	        hook);
 }
 
+enum class BlockOwnerLiveness { kAlive, kChanged, kUnrecoverable };
+
+BlockOwnerLiveness confirm_block_owner_liveness(const SharedBufferPoolHandle* handle,
+                                               const SharedBufferBlockHeaderAbi* block,
+                                               const OwnerObservation& observation) noexcept {
+	const bool foreign_boot =
+	        observation.owner.boot_id_hash_hi != handle->self.boot_id_hash_hi ||
+	        observation.owner.boot_id_hash_lo != handle->self.boot_id_hash_lo;
+	const Liveness liveness =
+	        foreign_boot ? Liveness::kUnverifiable
+	                     : probe_liveness(observation.owner.pid, observation.owner.proc_start_ticks);
+	const OwnerObservation confirmed = snapshot_block_owner(block);
+	if (confirmed.kind != OwnerSnapshotKind::kStable || confirmed.state != observation.state ||
+	    confirmed.epoch != observation.epoch || confirmed.owner.pid != observation.owner.pid ||
+	    confirmed.owner.proc_start_ticks != observation.owner.proc_start_ticks ||
+	    confirmed.owner.boot_id_hash_hi != observation.owner.boot_id_hash_hi ||
+	    confirmed.owner.boot_id_hash_lo != observation.owner.boot_id_hash_lo) {
+		return BlockOwnerLiveness::kChanged;
+	}
+	return liveness == Liveness::kAlive ? BlockOwnerLiveness::kAlive
+	                                   : BlockOwnerLiveness::kUnrecoverable;
+}
+
 uint64_t header_checksum(const SharedBufferPoolHeaderAbi* header) noexcept {
 	SharedBufferPoolHeaderAbi copy{};
 	auto* destination = reinterpret_cast<std::byte*>(&copy);
@@ -331,14 +354,12 @@ Result<void> classify_active_block(const SharedBufferPoolHandle* handle,
 		return make_error(ErrorCode::kConcurrentHandleUse, operation,
 		                  "block is owned by this process");
 	}
-	if (observation.owner.boot_id_hash_hi != handle->self.boot_id_hash_hi ||
-	    observation.owner.boot_id_hash_lo != handle->self.boot_id_hash_lo) {
-		return make_error(ErrorCode::kRecoveryBlocked, operation,
-		                  "block owner belongs to another boot");
+	const BlockOwnerLiveness liveness = confirm_block_owner_liveness(handle, block, observation);
+	if (liveness == BlockOwnerLiveness::kChanged) {
+		return make_error(ErrorCode::kBufferPoolContention, operation,
+		                  "block owner changed during liveness probe");
 	}
-	const Liveness liveness =
-	        probe_liveness(observation.owner.pid, observation.owner.proc_start_ticks);
-	if (liveness == Liveness::kAlive) {
+	if (liveness == BlockOwnerLiveness::kAlive) {
 		return make_error(ErrorCode::kBufferPoolContention, operation,
 		                  "block is owned by a live process");
 	}
@@ -905,7 +926,14 @@ Result<SharedBufferPoolStatus> shared_buffer_pool_status_impl(
 		case static_cast<uint32_t>(SharedBufferBlockState::kReading): {
 			const OwnerObservation observation = snapshot_block_owner(block);
 			switch (observation.kind) {
-				case OwnerSnapshotKind::kStable:
+				case OwnerSnapshotKind::kStable: {
+					const BlockOwnerLiveness liveness =
+					        confirm_block_owner_liveness(handle.get(), block, observation);
+					if (liveness == BlockOwnerLiveness::kChanged) {
+						return make_error(ErrorCode::kBufferPoolContention,
+						                  "SharedBufferPool::status",
+						                  "block owner changed during liveness probe");
+					}
 					switch (static_cast<SharedBufferBlockState>(observation.state)) {
 						case SharedBufferBlockState::kWriting:
 							++status.writing_blocks;
@@ -918,13 +946,11 @@ Result<SharedBufferPoolStatus> shared_buffer_pool_status_impl(
 							                  "SharedBufferPool::status",
 							                  "stable owner snapshot has invalid state");
 					}
-					if (observation.owner.boot_id_hash_hi != handle->self.boot_id_hash_hi ||
-					    observation.owner.boot_id_hash_lo != handle->self.boot_id_hash_lo ||
-					    probe_liveness(observation.owner.pid, observation.owner.proc_start_ticks) !=
-					            Liveness::kAlive) {
+					if (liveness == BlockOwnerLiveness::kUnrecoverable) {
 						++status.recovery_blocked_blocks;
 					}
 					break;
+				}
 				case OwnerSnapshotKind::kInactive:
 				case OwnerSnapshotKind::kClaiming:
 				case OwnerSnapshotKind::kUnstable:

@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "edge_runtime/buffer/shared_buffer_pool_layout.hpp"
+#include "edge_runtime/queue/mpmc_layout.hpp"
 #include "edge_runtime/common/error.hpp"
 #include "edge_runtime/buffer/shared_buffer_pool.hpp"
 #include "shared_buffer_pool_payload.hpp"
@@ -47,10 +48,13 @@ TEST(SharedBufferPoolLayout, FrozenAbiAndCheckedOffsets) {
 
 	EXPECT_EQ(sizeof(SharedBufferPoolHeaderAbi), 192u);
 	EXPECT_EQ(alignof(SharedBufferPoolHeaderAbi), 64u);
-	EXPECT_EQ(kSharedBufferPoolAbiMajor, 2u);
+	EXPECT_EQ(kSharedBufferPoolAbiMajor, 3u);
+	EXPECT_EQ(edge_runtime::detail::kSharedBufferPoolAbiMinor, 0u);
 	EXPECT_EQ(kSharedBufferPoolMagic[7], '2');
 	EXPECT_EQ(offsetof(SharedBufferPoolHeaderAbi, schema_fingerprint), 64u);
 	EXPECT_EQ(offsetof(SharedBufferPoolHeaderAbi, creator), 112u);
+	EXPECT_EQ(offsetof(SharedBufferPoolHeaderAbi, notify_epoch), 144u);
+	EXPECT_EQ(offsetof(SharedBufferPoolHeaderAbi, reserved), 148u);
 	EXPECT_EQ(sizeof(SharedBufferBlockHeaderAbi), 64u);
 	EXPECT_EQ(alignof(SharedBufferBlockHeaderAbi), 64u);
 	EXPECT_EQ(offsetof(SharedBufferBlockHeaderAbi, block_generation), 8u);
@@ -79,6 +83,16 @@ TEST(SharedBufferPoolLayout, FrozenAbiAndCheckedOffsets) {
 	EXPECT_EQ(payload_offset, 192u + 4160u + 64u);
 	EXPECT_FALSE(shared_buffer_pool_block_offset_for(4096, 2, 2, &block_offset,
 	                                                &payload_offset));
+}
+
+TEST(SharedBufferPoolLayout, QueueCloseAbiThreeIsFrozen) {
+	using edge_runtime::detail::MpmcQueueHeaderAbi;
+	EXPECT_EQ(edge_runtime::detail::kMpmcAbiMajor, 3u);
+	EXPECT_EQ(edge_runtime::detail::kMpmcAbiMinor, 0u);
+	EXPECT_STREQ(edge_runtime::detail::kMpmcHeaderMagic, "EDGMPMC2");
+	EXPECT_EQ(sizeof(MpmcQueueHeaderAbi), 320u);
+	EXPECT_EQ(alignof(MpmcQueueHeaderAbi), 64u);
+	EXPECT_EQ(offsetof(MpmcQueueHeaderAbi, closed), 164u);
 }
 
 TEST(SharedBufferPool, FixedBlockLifecycleAndReuse) {
