@@ -110,6 +110,83 @@ build/selfipcs-release/tools/self_ipcs_shm_bench --smoke --notification eventfd 
 ASan/UBSan 的新旧通知示例完成 2 组。比较入口以相同条件的 50 样本 smoke 校验启动握手、
 序号及分位数，eventfd 的正式性能采集单独进行。
 
+### 可选 C++20 协程消费
+
+`SELFIPCS_BUILD_ASYNC=ON` 构建独立的 Boost.Asio 组件；核心和默认 SDK 保持 C++17。
+组件使用 Boost ≥ 1.74 的 descriptor、strand、steady_timer 和 awaitable：
+
+```bash
+cmake -S . -B build/selfipcs-async -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF -DSELFIPCS_BUILD_ASYNC=ON
+cmake --build build/selfipcs-async
+cmake --install build/selfipcs-async --prefix /your/async-prefix
+cmake -S examples/async_consume_demo -B /tmp/selfipcs-async-demo \
+  -DCMAKE_PREFIX_PATH=/your/async-prefix
+cmake --build /tmp/selfipcs-async-demo
+/tmp/selfipcs-async-demo/async_consume_demo
+```
+
+下游使用 `find_package(SelfIPCs CONFIG REQUIRED COMPONENTS async)` 和
+`SelfIPCs::async`，头文件为 `self_ipcs/async/consumer.hpp`。普通
+`find_package(SelfIPCs CONFIG REQUIRED)` 只加载 C++17 核心依赖。
+
+- `self_ipcs::async::Consumer<T>::create(executor, std::move(consumer))` 同步完成有界通知注册；
+  在启动事件循环前准备句柄。适配器拥有 Consumer、通知对象和供 Asio 监听的聚合 FD 副本。
+- `async_wait_latest(steady_clock::time_point)` 返回拷贝后的 `Result<Sample<T>>`。
+  多个独立通道共享一个 `io_context`；每个句柄通过 strand 串行处理，最多一个在途等待。
+- 数据读取沿用 `drain → try_read_latest`，包括 producer 退出时最后已提交的样本。
+  deadline 为单一绝对时间；数据、timeout、cancel、stop 竞争由同一串行状态机选出一次结果。
+- `cancel()` 取消当前等待，随后可以重新等待；`stop()` / `close()` 为持久关闭。
+  取消和关闭返回携带 `ECANCELED` 的错误，超时返回 `Timeout`，重复在途操作返回
+  `ConcurrentHandleUse`。FD/timer 取消回调收齐后才完成当前操作并允许下一次等待。
+- 移动转移句柄所有权，析构请求关闭。应用保持事件循环运行，直到任务和关闭回调处理完毕，
+  再销毁执行器；关闭完成时释放底层 Consumer，允许重新打开同一通道。
+  等待过程持有共享操作状态，槽位借用在每次拷贝读取结束时释放。
+
+`examples/async_consume_demo/` 以真实 `fork/exec` producer 演示两个独立通道共用一个事件循环，
+并展示 timeout、cancel、重新等待和 close。增加 `SELFIPCS_DEMO_USE_LEGACY=ON` 可组合旧核心包入口。
+
+### Linux 混合 I/O 与软件通知实验
+
+`examples/mixed_io_demo/` 将 SPSC 聚合通知 FD、SocketCAN、timerfd 和停止 eventfd 放在同一个
+level-triggered epoll 消费循环中。每轮按有界批次处理各来源，先读取最终样本再处理终止状态，
+移除 epoll 监听后关闭 FD。示例接受专用 CAN 接口，通过真实 `fork/exec` 独立打开通道。
+vcan 场景、物理 CAN 硬件和正式性能分别记录对应运行环境。
+
+```bash
+cmake -S examples/mixed_io_demo -B /tmp/selfipcs-mixed-demo \
+  -DCMAKE_PREFIX_PATH=/your/prefix
+cmake --build /tmp/selfipcs-mixed-demo
+# 新建专属临时 user/network namespace 与 vcan，保存独立运行日志
+python3 scripts/run_mixed_io_demo.py --binary /tmp/selfipcs-mixed-demo/mixed_io_demo \
+  --output-root /tmp
+```
+
+独立实验模块位于 `kernel/notification/`，通过 miscdevice 提供每个 open-file-description
+一个软件通知对象；`dup` 和 `SCM_RIGHTS` 共享该对象。普通 SDK 构建与使用保持原有路径。
+
+```bash
+# 在全新输出目录编译当前内核模块和用户态 probe；脚本仅构建
+python3 scripts/build_software_notification.py --output-root /tmp
+# headers 使用另一版本 GCC 时增加 --kernel-cc /absolute/path/to/matching-gcc
+# 使用脚本打印的 OUTPUT 绝对目录，由具备模块管理权限的用户执行
+sudo insmod /absolute/OUTPUT/module/self_ipcs_notification.ko
+sudo /absolute/OUTPUT/self_ipcs_notification_probe --device /dev/self_ipcs_notification
+# 全部使用方退出并关闭 FD 后，正常卸载
+sudo rmmod self_ipcs_notification
+```
+
+UAPI 在 `kernel/notification/include/uapi/`：`read` / `write` 使用本机字节序的固定 8B 无符号计数，
+每次成功读取确认当前全部积压；`EFAULT` 保留积压，计数溢出返回 `EOVERFLOW` 并保留原值。
+`O_NONBLOCK` 无可读通知或操作锁暂忙时返回 `EAGAIN`；阻塞读取可由信号中断并返回 `EINTR`。
+`SELF_IPCS_NOTIFICATION_STOP` 为持久停止：唤醒等待者，先排空已有计数，再返回 EOF / poll HUP；
+停止后的写入返回 `EPIPE`。模块以 `THIS_MODULE` 持有引用，最后一个 file 引用释放时回收对象。
+设备默认权限 `0600`，加载受当前系统模块权限和签名策略管理。
+
+有限对照入口 `scripts/run_notification_matrix.py` 与独立验证器
+`scripts/verify_notification_matrix.py` 固定 64B、100/1000Hz、同核/跨核、futex/eventfd 各三轮，
+保存 raw worker、CSV、工作区间及完整进程生命周期 CPU。正式采集与完整场景/竞态验收在功能集成后统一执行。
+
 ### 新入口与兼容
 
 公共头按 `self_ipcs/{common,channel,queue,buffer,process}/` 划分，例如 `#include <self_ipcs/queue/mpmc_queue.hpp>`，C++ 使用 `self_ipcs::MpmcQueue<T>`。`self_ipcs` 是原实现命名空间的 alias，新旧入口共用 `libself_ipcs.a`，保留原有链接符号与进程间协议。
