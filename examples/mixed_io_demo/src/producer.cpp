@@ -204,8 +204,8 @@ bool session(Options options, LockIdentity& lock) {
 bool run_producer(const Options& options) {
 	LockIdentity lock;
 	const bool result = session(options, lock);
-	const bool cleaned = lock.remove();
-	return result && cleaned;
+	if (!result) return false;
+	return lock.remove();
 }
 
 }

@@ -171,6 +171,14 @@ if(BUILD_TESTING)
 
   if(Python3_Interpreter_FOUND)
     add_test(
+      NAME notification_matrix_regression
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_notification_matrix.py
+              --binary-dir $<TARGET_FILE_DIR:edge_shm_bench>
+              --output-root ${CMAKE_BINARY_DIR})
+    set_tests_properties(notification_matrix_regression PROPERTIES
+      TIMEOUT 60 LABELS benchmark ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
+
+    add_test(
       NAME benchmark_worker_deadline_regression
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_bench_worker_deadline.py
               --driver $<TARGET_FILE:edge_shm_bench> --output-root ${CMAKE_BINARY_DIR})
