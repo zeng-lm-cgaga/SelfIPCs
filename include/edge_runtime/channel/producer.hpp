@@ -25,6 +25,9 @@ uint64_t producer_generation_impl(const std::shared_ptr<ProducerHandle>& handle)
 void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 Result<void> producer_heartbeat_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
+Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle);
+Result<void> producer_disable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
+int producer_event_notification_error_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 
 }  // 命名空间 edge_runtime::detail
 
@@ -76,6 +79,16 @@ class Producer {
 	// 向共享状态写入应用进度；关闭心跳时该调用不改变数据。
 	Result<void> heartbeat() noexcept {
 		return detail::producer_heartbeat_impl(handle_);
+	}
+
+	Result<void> enable_event_notifications() {
+		return detail::producer_enable_event_notifications_impl(handle_);
+	}
+	Result<void> disable_event_notifications() noexcept {
+		return detail::producer_disable_event_notifications_impl(handle_);
+	}
+	int event_notification_error() const noexcept {
+		return detail::producer_event_notification_error_impl(handle_);
 	}
 
 	Producer(const Producer&) = delete;

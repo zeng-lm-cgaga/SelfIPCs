@@ -1,5 +1,7 @@
 // 基准驱动让独立生产者和消费者同时运行，记录吞吐、CPU 时间和每条样本的延迟。
+#include <poll.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -17,8 +19,11 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "edge_runtime_tool/bench_notification.hpp"
+#include "edge_runtime_tool/bench_child.hpp"
 #include "edge_runtime_tool/tool_common.hpp"
 
 namespace {
@@ -28,11 +33,13 @@ using edge_tool::arg_value;
 
 constexpr const char* kPerfEventParanoidPath = "/proc/sys/kernel/perf_event_paranoid";
 constexpr const char* kYamaPtraceScopePath = "/proc/sys/kernel/yama/ptrace_scope";
+constexpr int64_t kEventfdStartupGraceMs = 17000;
 
 struct RunSpec {
 	std::string id;
 	std::string transport;
 	std::string mode;
+	edge_tool::BenchNotification notification = edge_tool::BenchNotification::kFutex;
 	uint32_t payload = 64;
 	std::string placement;
 	std::string rate_label;
@@ -59,14 +66,10 @@ struct Config {
 	bool perf_ok = false;
 };
 
-struct ChildResult {
-	int exit_code = 127;
-	int signum = 0;
-	bool exec_ok = false;
-	std::string out;
-	uint64_t wall_us = 0;
-	struct rusage ru {};
-};
+using edge_tool::ChildResult;
+using edge_tool::ChildHandle;
+using edge_tool::spawn_child;
+using edge_tool::collect_child;
 
 bool mkdirs(const std::string& path) {
 	std::string cur;
@@ -90,81 +93,6 @@ std::string read_sys_file(const char* path) {
 	std::string s = buf;
 	while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
 	return s;
-}
-
-struct ChildHandle {
-	pid_t pid = -1;
-	int pipe_read = -1;
-	struct timespec spawned {};
-	bool valid() const { return pid > 0 && pipe_read >= 0; }
-};
-
-ChildHandle spawn_child(const std::vector<std::string>& argv) {
-	int pipefd[2] = {-1, -1};
-	if (::pipe(pipefd) != 0) return {};
-	const pid_t pid = ::fork();
-	if (pid < 0) {
-		::close(pipefd[0]);
-		::close(pipefd[1]);
-		return {};
-	}
-	if (pid == 0) {
-		::close(pipefd[0]);
-		::dup2(pipefd[1], STDOUT_FILENO);
-		::dup2(pipefd[1], STDERR_FILENO);
-		::close(pipefd[1]);
-		std::vector<char*> cargv;
-		cargv.reserve(argv.size() + 1);
-		for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
-		cargv.push_back(nullptr);
-		::execvp(cargv[0], cargv.data());
-		std::fprintf(stderr, "exec %s: %s\n", cargv[0], std::strerror(errno));
-		_exit(127);
-	}
-	::close(pipefd[1]);
-	struct timespec spawned {};
-	::clock_gettime(CLOCK_MONOTONIC, &spawned);
-	return {pid, pipefd[0], spawned};
-}
-
-ChildResult collect_child(ChildHandle h) {
-	ChildResult res;
-	if (!h.valid()) return res;
-	std::string out;
-	char buf[4096];
-	for (;;) {
-		const ssize_t n = ::read(h.pipe_read, buf, sizeof(buf));
-		if (n > 0) {
-			out.append(buf, static_cast<size_t>(n));
-		} else if (n == 0) {
-			break;
-		} else if (errno == EINTR) {
-			continue;
-		} else {
-			break;
-		}
-	}
-	::close(h.pipe_read);
-	res.out = out;
-	int status = 0;
-	::wait4(h.pid, &status, 0, &res.ru);
-	struct timespec t1 {};
-	::clock_gettime(CLOCK_MONOTONIC, &t1);
-	int64_t ns = static_cast<int64_t>(t1.tv_nsec) - static_cast<int64_t>(h.spawned.tv_nsec);
-	int64_t sec = static_cast<int64_t>(t1.tv_sec) - static_cast<int64_t>(h.spawned.tv_sec);
-	if (ns < 0) {
-		ns += 1000000000LL;
-		sec -= 1;
-	}
-	res.wall_us = static_cast<uint64_t>(sec) * 1000000ull + static_cast<uint64_t>(ns) / 1000ull;
-	if (WIFEXITED(status)) {
-		res.exec_ok = true;
-		res.exit_code = WEXITSTATUS(status);
-	} else if (WIFSIGNALED(status)) {
-		res.exec_ok = true;
-		res.signum = WTERMSIG(status);
-	}
-	return res;
 }
 
 ChildResult spawn_collect(const std::vector<std::string>& argv) {
@@ -523,6 +451,10 @@ void write_summary_json(const Config& cfg, const RunSpec& spec, const std::strin
 	j += "  \"run_id\": \"" + spec.id + "\",\n";
 	j += "  \"transport\": \"" + spec.transport + "\",\n";
 	j += "  \"mode\": \"" + spec.mode + "\",\n";
+	j += "  \"notification\": \"" +
+	     std::string(spec.transport == "shm" && spec.mode != "poll"
+	                         ? edge_tool::bench_notification_name(spec.notification)
+	                         : "none") + "\",\n";
 	j += "  \"payload_bytes\": " + std::to_string(spec.payload) + ",\n";
 	j += "  \"placement\": \"" + spec.placement + "\",\n";
 	j += "  \"rate_hz\": " + std::to_string(spec.rate_hz) + ",\n";
@@ -663,8 +595,12 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 		oc.fail_reason = "mkdir " + dir + " failed";
 		return oc;
 	}
-	const std::string chan = "er7_bench_" + std::to_string(ordinal);
+	const std::string chan = "er7_bench_" + std::to_string(::getpid()) + "_" +
+	                         std::to_string(edge_tool::monotonic_ms_now()) + "_" +
+	                         std::to_string(ordinal);
 	const std::string csv_raw = dir + "/samples.raw.csv";
+	edge_tool::BenchReadyPair startup;
+	if (!startup.open()) { oc.fail_reason = "startup socketpair failed"; return oc; }
 
 	std::vector<std::string> pargv;
 	const std::string pp = placement_prefix(cfg, spec, true);
@@ -683,6 +619,10 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	pargv.push_back(std::to_string(spec.max_time_ms));
 	pargv.push_back("--rate");
 	pargv.push_back(std::to_string(spec.rate_hz));
+	pargv.push_back("--notification");
+	pargv.push_back(edge_tool::bench_notification_name(spec.notification));
+	pargv.push_back("--ready-fd");
+	pargv.push_back(std::to_string(startup.reader()));
 	if (spec.rate_hz > 0) {
 		pargv.push_back("--wait-consumer-ms");
 		pargv.push_back("5000");
@@ -704,7 +644,11 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	cargv.push_back("--csv");
 	cargv.push_back(csv_raw);
 	cargv.push_back("--mode");
-	cargv.push_back(spec.mode);
+	cargv.push_back(spec.mode == "eventfd" ? "futex" : spec.mode);
+	cargv.push_back("--notification");
+	cargv.push_back(edge_tool::bench_notification_name(spec.notification));
+	cargv.push_back("--ready-fd");
+	cargv.push_back(std::to_string(startup.writer()));
 	cargv.push_back("--max-samples");
 	cargv.push_back(std::to_string(spec.samples));
 	cargv.push_back("--max-time-ms");
@@ -714,10 +658,17 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 
 	write_command(spec, dir, pargv, cargv);
 
-	const ChildHandle ph = spawn_child(pargv);
-	const ChildHandle ch = spawn_child(cargv);
-	ChildResult prod = collect_child(ph);
-	ChildResult cons = collect_child(ch);
+	const int64_t child_deadline_ms =
+	        spec.notification == edge_tool::BenchNotification::kEventfd
+	                ? edge_tool::monotonic_ms_now() +
+	                          static_cast<int64_t>(spec.max_time_ms > 0 ? spec.max_time_ms : 60000) +
+	                          kEventfdStartupGraceMs
+	                : 0;
+	const ChildHandle ph = spawn_child(pargv, startup.reader());
+	const ChildHandle ch = spawn_child(cargv, startup.writer());
+	startup.close();
+	ChildResult prod = collect_child(ph, child_deadline_ms);
+	ChildResult cons = collect_child(ch, child_deadline_ms);
 
 	const ProducerMarkers pm = parse_producer(prod.out);
 	const ConsumerMarkers cm = parse_consumer(cons.out);
@@ -740,6 +691,7 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	                true, "");
 
 	std::string reason;
+	if (prod.timed_out || cons.timed_out) reason += "worker or descendant watchdog failure";
 	if (prod.signum != 0) reason += "producer killed by signal " + std::to_string(prod.signum);
 	if (!prod.exec_ok || prod.exit_code != 0) {
 		if (!reason.empty()) reason += "; ";
@@ -872,6 +824,7 @@ RunOutcome run_socket(const Config& cfg, const RunSpec& spec) {
 	                comparison, true, "");
 
 	std::string reason;
+	if (prod.timed_out || cons.timed_out) reason += "worker or descendant watchdog failure";
 	if (!prod.exec_ok || prod.exit_code != 0 || prod.signum != 0) {
 		reason += "producer exit " + std::to_string(prod.exit_code) + " signum " +
 		          std::to_string(prod.signum) + " (" + prod.out + ")";
@@ -929,6 +882,20 @@ RunSpec spec_of(std::string id, std::string transport, std::string mode, uint32_
 	s.warmup = warmup;
 	s.require_comparable = require_comparable;
 	return s;
+}
+
+std::vector<RunSpec> with_notification(std::vector<RunSpec> runs,
+                                     edge_tool::BenchNotification notification) {
+	if (notification == edge_tool::BenchNotification::kEventfd) {
+		for (auto& spec : runs) {
+			if (spec.transport != "shm" || spec.mode != "futex") continue;
+			spec.notification = notification;
+			spec.mode = "eventfd";
+			const size_t position = spec.id.find("-futex-");
+			if (position != std::string::npos) spec.id.replace(position, 7, "-eventfd-");
+		}
+	}
+	return runs;
 }
 
 std::vector<RunSpec> smoke_specs() {
@@ -1102,17 +1069,18 @@ int main(int argc, char** argv) {
 	bool want_matrix = edge_tool::arg_flag(argc, argv, "--matrix");
 	bool want_list = edge_tool::arg_flag(argc, argv, "--list");
 	const char* only = edge_tool::arg_value(argc, argv, "--only");
+	const auto notification = edge_tool::bench_notification_from_args(argc, argv);
 
 	const bool has_helpers =
 	        !cfg.producer_bin.empty() && !cfg.consumer_bin.empty() && !cfg.sock_bin.empty();
 	if (want_list) {
-		for (const auto& s : smoke_specs()) {
+		for (const auto& s : with_notification(smoke_specs(), notification)) {
 			std::printf("%-40s %-6s %-5s %6uB %-10s %-6s\n", s.id.c_str(),
 			            s.transport.c_str(), s.mode.c_str(), s.payload,
 			            s.placement.c_str(), s.rate_label.c_str());
 		}
 		std::printf("--- evidence ---\n");
-		for (const auto& s : evidence_specs()) {
+		for (const auto& s : with_notification(evidence_specs(), notification)) {
 			std::printf("%-40s %-6s %-5s %6uB %-10s %-6s\n", s.id.c_str(),
 			            s.transport.c_str(), s.mode.c_str(), s.payload,
 			            s.placement.c_str(), s.rate_label.c_str());
@@ -1123,7 +1091,10 @@ int main(int argc, char** argv) {
 		std::fprintf(stderr,
 		             "usage: self_ipcs_shm_bench (--smoke|--evidence|--matrix) "
 		             "[--producer <bin>] [--consumer <bin>] [--sock <bin>] "
-		             "[--ctl <bin>] [--out-dir <dir>] [--only <id,...>]\n");
+		             "[--ctl <bin>] [--out-dir <dir>] [--only <id,...>] "
+		             "[--notification futex|eventfd]\n"
+		             "       eventfd replaces shm futex waits; poll/socket cases are unchanged.\n"
+		             "       --list shows the selected notification's run IDs.\n");
 		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 
@@ -1158,6 +1129,7 @@ int main(int argc, char** argv) {
 		runs = evidence_specs();
 	else if (want_matrix)
 		runs = matrix_specs();
+	runs = with_notification(std::move(runs), notification);
 	if (only != nullptr) {
 
 		std::vector<std::string> want;

@@ -43,6 +43,43 @@ def process_group_alive(pgid: int) -> bool:
     return True
 
 
+def _session_groups(session_id: int) -> dict[int, int]:
+    if session_id <= 1 or session_id == os.getsid(0):
+        raise ValueError("cleanup requires a dedicated child session")
+    groups: dict[int, int] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            fields = stat[stat.rfind(")") + 2:].split()
+            if fields[0] not in ("Z", "X") and int(fields[3]) == session_id:
+                groups[int(fields[2])] = int(entry.name)
+        except (OSError, ValueError, IndexError):
+            continue
+    return groups
+
+
+def _signal_session(session_id: int, signum: signal.Signals) -> bool:
+    sent = False
+    for group, member in _session_groups(session_id).items():
+        try:
+            if os.getsid(member) == session_id and os.getpgid(member) == group:
+                sent = _signal_group(group, signum) or sent
+        except ProcessLookupError:
+            continue
+    return sent
+
+
+def _wait_session_gone(session_id: int, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while _session_groups(session_id):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def _signal_group(pgid: int, signum: signal.Signals) -> bool:
     try:
         os.killpg(pgid, signum)
@@ -63,25 +100,25 @@ def _wait_group_gone(pgid: int, timeout_s: float) -> bool:
 def _terminate_group(process: subprocess.Popen[str], pgid: int,
                      term_grace_s: float) -> tuple[bool, bool, bool]:
     """Terminate a session and report TERM/KILL/orphan cleanup actions."""
-    _signal_group(pgid, signal.SIGCONT)
-    term_sent = _signal_group(pgid, signal.SIGTERM)
+    _signal_session(pgid, signal.SIGCONT)
+    term_sent = _signal_session(pgid, signal.SIGTERM)
     kill_sent = False
     try:
         process.wait(timeout=term_grace_s)
     except subprocess.TimeoutExpired:
-        _signal_group(pgid, signal.SIGCONT)
-        kill_sent = _signal_group(pgid, signal.SIGKILL)
+        _signal_session(pgid, signal.SIGCONT)
+        kill_sent = _signal_session(pgid, signal.SIGKILL)
         process.wait(timeout=term_grace_s)
 
-    orphan_group_reaped = process_group_alive(pgid)
+    orphan_group_reaped = bool(_session_groups(pgid))
     if orphan_group_reaped:
-        _signal_group(pgid, signal.SIGCONT)
-        _signal_group(pgid, signal.SIGTERM)
-        if not _wait_group_gone(pgid, term_grace_s):
-            _signal_group(pgid, signal.SIGCONT)
-            kill_sent = _signal_group(pgid, signal.SIGKILL) or kill_sent
-            if not _wait_group_gone(pgid, term_grace_s):
-                raise RuntimeError(f"orphan process group {pgid} survived cleanup")
+        _signal_session(pgid, signal.SIGCONT)
+        _signal_session(pgid, signal.SIGTERM)
+        if not _wait_session_gone(pgid, term_grace_s):
+            _signal_session(pgid, signal.SIGCONT)
+            kill_sent = _signal_session(pgid, signal.SIGKILL) or kill_sent
+            if not _wait_session_gone(pgid, term_grace_s):
+                raise RuntimeError(f"child session {pgid} survived cleanup")
     return term_sent, kill_sent, orphan_group_reaped
 
 
@@ -89,7 +126,7 @@ def terminate_process_group(process: subprocess.Popen[str], term_grace_s: float 
     """Best-effort bounded cleanup for a process already started by a caller."""
     if term_grace_s <= 0:
         raise ValueError("term_grace_s must be positive")
-    if process.poll() is not None and not process_group_alive(process.pid):
+    if process.poll() is not None and not _session_groups(process.pid):
         return False, False, False
     return _terminate_group(process, process.pid, term_grace_s)
 
@@ -200,7 +237,7 @@ def run_logged_process(
 
             if process.poll() is None:
                 process.wait(timeout=term_grace_s)
-            if pgid is not None and process_group_alive(pgid):
+            if pgid is not None and _session_groups(pgid):
                 extra_term, extra_kill, orphan = _terminate_group(process, pgid, term_grace_s)
                 term_sent = term_sent or extra_term
                 kill_sent = kill_sent or extra_kill

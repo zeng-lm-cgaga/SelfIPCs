@@ -1,4 +1,5 @@
 #include "edge_runtime/channel/producer_impl.hpp"
+#include "edge_runtime/channel/notification_service.hpp"
 
 #include <unistd.h>
 
@@ -71,6 +72,7 @@ void mark_producer_offline(ProducerHandle& handle) noexcept {
 
 	shared_store_release(&header->producer_state,
 	                     static_cast<uint32_t>(EndpointState::kOffline));
+	if (handle.notification_server) handle.notification_server->stop();
 	if (handle.transport != Transport::kMemfdFdPass || handle.socket_unlinked) return;
 
 	handle.serve_stop.store(true, std::memory_order_relaxed);
@@ -714,12 +716,40 @@ Result<PublishInfo> producer_publish_impl(const std::shared_ptr<ProducerHandle>&
 	shared_store_relaxed(&header->last_publish_boot_ns, publish_boot_ns);
 	shared_fetch_add_relaxed(&header->notify_epoch, uint32_t{1});
 	(void)futex_wake(&header->notify_epoch, 1);
+	if (handle->notification_server) handle->notification_server->notify();
 
 	return Result<PublishInfo>(PublishInfo{handle->generation, next_sequence, publish_boot_ns});
 }
 
 uint64_t producer_generation_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
 	return handle ? handle->generation : 0;
+}
+
+Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle) {
+	if (!handle) return make_error(ErrorCode::kStaleHandle, "Producer::enable_event_notifications");
+	ProducerUseGuard use(&handle->operation_in_use);
+	if (!use) return make_error(ErrorCode::kConcurrentHandleUse, "Producer::enable_event_notifications");
+	auto verified = verify_handle_ownership(*handle, "Producer::enable_event_notifications");
+	if (!verified) return verified.error();
+	if (handle->notification_server) return Result<void>::ok();
+	auto server = NotificationServer::start(*handle);
+	if (!server) return server.error();
+	handle->notification_server = std::move(server.value());
+	return Result<void>::ok();
+}
+
+Result<void> producer_disable_event_notifications_impl(
+        const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	if (!handle) return make_error(ErrorCode::kStaleHandle, "Producer::disable_event_notifications");
+	ProducerUseGuard use(&handle->operation_in_use);
+	if (!use) return make_error(ErrorCode::kConcurrentHandleUse, "Producer::disable_event_notifications");
+	if (handle->notification_server) handle->notification_server->stop();
+	handle->notification_server.reset();
+	return Result<void>::ok();
+}
+
+int producer_event_notification_error_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	return handle && handle->notification_server ? handle->notification_server->last_error() : 0;
 }
 
 Result<ChannelStatus> producer_status_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
@@ -853,6 +883,7 @@ Result<PublishInfo> producer_commit_loan_impl(WriteLoan* loan) noexcept {
 	shared_store_relaxed(&header->last_publish_boot_ns, publish_boot_ns);
 	shared_fetch_add_relaxed(&header->notify_epoch, uint32_t{1});
 	(void)futex_wake(&header->notify_epoch, 1);
+	if (handle->notification_server) handle->notification_server->notify();
 
 	const PublishInfo info{handle->generation, loan->sequence_, publish_boot_ns};
 	loan->active_ = false;
@@ -927,6 +958,8 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 			(void)::shutdown(handle->listen_fd.get(), SHUT_RDWR);
 		}
 	}
+	if (handle->notification_server) handle->notification_server->stop();
+	handle->notification_server.reset();
 
 	JournalGuard journal_guard;
 	journal_guard.lock = &lock;

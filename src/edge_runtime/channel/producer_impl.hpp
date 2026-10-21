@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "edge_runtime/channel/channel_options.hpp"
+#include "edge_runtime/channel/event_notification.hpp"
 #include "edge_runtime/process/process_identity.hpp"
 #include "edge_runtime/transport/shm_object.hpp"
 #include "edge_runtime/channel/loan.hpp"
@@ -20,6 +21,8 @@
 #include "edge_runtime/common/schema.hpp"
 
 namespace edge_runtime::detail {
+
+class NotificationServer;
 
 // ProducerHandle 固定当前实例的名称、代数、文件身份和 Schema；发布前会再次核对这些身份。
 struct ProducerHandle {
@@ -46,6 +49,7 @@ struct ProducerHandle {
 	bool socket_unlinked{false};
 
 	uint64_t heartbeat_interval_ns{0};
+	std::shared_ptr<NotificationServer> notification_server;
 
 	~ProducerHandle() {
 

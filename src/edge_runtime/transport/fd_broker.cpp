@@ -18,6 +18,7 @@
 #include "edge_runtime/utility/checked_math.hpp"
 #include "edge_runtime/utility/checksum.hpp"
 #include "edge_runtime/utility/failpoint.hpp"
+#include "edge_runtime/transport/socket_io.hpp"
 
 #if defined(__linux__)
 #define EDGE_HAVE_MEMFD_CREATE 1
@@ -32,37 +33,12 @@ namespace {
 inline constexpr uint32_t kListenBacklog = 4;
 inline constexpr uint64_t kConnectRetryIntervalNs = 10'000'000;
 inline constexpr uint64_t kServePollIntervalNs = 10'000'000;
-
-struct IoBudget {
-	uint64_t deadline_ns;
-	const std::atomic<bool>* stop = nullptr;
-};
-
-bool budget_available(const IoBudget& budget) noexcept {
-	return (budget.stop == nullptr || !budget.stop->load(std::memory_order_relaxed)) &&
-	       remaining_time_ns(budget.deadline_ns) != 0;
-}
-
-bool wait_socket(int fd, short events, const IoBudget& budget) noexcept {
-	while (budget_available(budget)) {
-		uint64_t remaining = remaining_time_ns(budget.deadline_ns);
-		if (budget.stop != nullptr) remaining = std::min(remaining, kServePollIntervalNs);
-		remaining = std::min(remaining, uint64_t{1'000'000'000});
-		struct pollfd descriptor {
-			fd, events, 0
-		};
-		const int ready =
-		        ::poll(&descriptor, 1, static_cast<int>((remaining + 999'999) / 1'000'000));
-		if (ready < 0) {
-			if (errno == EINTR) continue;
-			return false;
-		}
-		if (ready == 0) continue;
-		return budget_available(budget) &&
-		       (descriptor.revents & (events | POLLHUP | POLLERR)) != 0;
-	}
-	return false;
-}
+using socket_io::IoBudget;
+using socket_io::budget_available;
+using socket_io::wait_socket;
+using socket_io::recv_full;
+using socket_io::send_full;
+using socket_io::peer_is_same_uid;
 
 bool retry_pause(const IoBudget& budget) noexcept {
 	const uint64_t remaining = remaining_time_ns(budget.deadline_ns);
@@ -101,50 +77,6 @@ bool request_fingerprint_set(const FdBrokerRequestAbi& r) noexcept {
 	return false;
 }
 
-bool recv_full(int fd, void* buf, size_t size, const IoBudget& budget) noexcept {
-	auto* dst = static_cast<char*>(buf);
-	size_t got = 0;
-	while (got < size) {
-		if (!wait_socket(fd, POLLIN, budget)) return false;
-		const ssize_t n = ::recv(fd, dst + got, size - got, MSG_DONTWAIT);
-		if (n < 0) {
-			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-			return false;
-		}
-		if (n == 0) return false;
-		got += static_cast<size_t>(n);
-	}
-	return budget_available(budget);
-}
-
-// 文件描述符传递是一次性交互；请求、回复或辅助数据任一失败都关闭本次连接。
-bool send_full(int fd, const void* buf, size_t size, const IoBudget& budget) noexcept {
-	const auto* src = static_cast<const char*>(buf);
-	size_t sent = 0;
-	while (sent < size) {
-		if (!budget_available(budget)) return false;
-		const ssize_t n = ::send(fd, src + sent, size - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
-		if (n < 0) {
-			if (errno == EINTR) continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				if (!wait_socket(fd, POLLOUT, budget)) return false;
-				continue;
-			}
-			return false;
-		}
-		if (n == 0) return false;
-		sent += static_cast<size_t>(n);
-	}
-	return budget_available(budget);
-}
-
-bool peer_is_same_uid(int fd) noexcept {
-	struct ucred cred {};
-	socklen_t len = sizeof(cred);
-	if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return false;
-	return cred.uid == geteuid();
-}
-
 bool socket_has_live_peer(const std::string& path) noexcept {
 	const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (fd < 0) return true;
@@ -158,7 +90,15 @@ bool socket_has_live_peer(const std::string& path) noexcept {
 	return rc == 0 || (errno != ECONNREFUSED && errno != ENOENT);
 }
 
-bool unlink_socket(const std::string& path) noexcept {
+bool unlink_socket(const std::string& path, uint64_t device = 0, uint64_t inode = 0) noexcept {
+	struct stat observed {};
+	if (::lstat(path.c_str(), &observed) != 0) return errno == ENOENT;
+	if (!S_ISSOCK(observed.st_mode) || observed.st_uid != ::geteuid() ||
+	    (inode != 0 && (static_cast<uint64_t>(observed.st_dev) != device ||
+	                   static_cast<uint64_t>(observed.st_ino) != inode))) {
+		errno = EEXIST;
+		return false;
+	}
 	return ::unlink(path.c_str()) == 0 || errno == ENOENT;
 }
 
@@ -322,14 +262,21 @@ Result<UniqueFd> fd_broker_bind(const std::string& socket_path) {
 		return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 	}
 
+	struct stat bound {};
+	if (::lstat(socket_path.c_str(), &bound) != 0 || !S_ISSOCK(bound.st_mode) ||
+	    bound.st_uid != ::geteuid()) {
+		return make_error(ErrorCode::kTransportFailed, "fd_broker_bind", "bound socket identity unavailable");
+	}
 	if (::chmod(socket_path.c_str(), static_cast<mode_t>(S_IRUSR | S_IWUSR)) != 0) {
 		const int e = errno;
-		(void)::unlink(socket_path.c_str());
+		(void)unlink_socket(socket_path, static_cast<uint64_t>(bound.st_dev),
+		                    static_cast<uint64_t>(bound.st_ino));
 		return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 	}
 	if (::listen(fd, static_cast<int>(kListenBacklog)) != 0) {
 		const int e = errno;
-		(void)::unlink(socket_path.c_str());
+		(void)unlink_socket(socket_path, static_cast<uint64_t>(bound.st_dev),
+		                    static_cast<uint64_t>(bound.st_ino));
 		return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 	}
 	return Result<UniqueFd>(std::move(listen_fd));

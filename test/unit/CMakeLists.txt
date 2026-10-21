@@ -8,7 +8,7 @@ function(edgeruntime_unit_test name)
     ${name} PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
       ${CMAKE_SOURCE_DIR}/src)
-  gtest_discover_tests(${name})
+  gtest_discover_tests(${name} ${ARGN})
 endfunction()
 
 # 单元测试覆盖 ABI、错误分类、进程身份、槽协议、传输和监督策略。
@@ -40,6 +40,12 @@ target_sources(creation_failure_test PRIVATE ../fixtures/creation_faults.cpp)
 target_link_options(creation_failure_test PRIVATE
   "-Wl,--wrap=fstat" "-Wl,--wrap=shm_open" "-Wl,--wrap=statx")
 edgeruntime_unit_test(channel_options_test)
+edgeruntime_unit_test(event_notification_test PROPERTIES TIMEOUT 15)
+edgeruntime_unit_test(notification_bench_driver_test PROPERTIES TIMEOUT 15)
+target_sources(notification_bench_driver_test PRIVATE ../../tools/src/bench_child.cpp)
+target_include_directories(notification_bench_driver_test PRIVATE ${CMAKE_SOURCE_DIR}/tools/include)
+target_link_options(event_notification_test PRIVATE
+  "LINKER:--wrap=eventfd,--wrap=write,--wrap=read,--wrap=sendmsg,--wrap=recvmsg,--wrap=send,--wrap=recv,--wrap=poll")
 
 add_executable(broker_observer_peer broker_observer_peer.cpp broker_observer_fixture.cpp
   broker_observer_syscall_fixture.cpp)

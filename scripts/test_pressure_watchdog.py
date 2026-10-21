@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 
-from pressure_process import run_logged_process
+from pressure_process import run_logged_process, _session_groups
 
 
 def clean_env() -> dict[str, str]:
@@ -167,12 +167,19 @@ def run_fixture(root: Path) -> dict[str, object]:
     case_dir.mkdir()
     sentinel = case_dir / "external-sentinel"
     sentinel.write_text("must-survive\n", encoding="utf-8")
-    fixture = (
-        "import os, signal, time;"
-        "child=os.fork();"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN) if child == 0 else None;"
-        "time.sleep(30)"
-    )
+    nested = case_dir / "nested.json"
+    fixture = f"""import os, signal, time, json
+from pathlib import Path
+child = os.fork()
+if child == 0:
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    grandchild = os.fork()
+    if grandchild != 0:
+        Path({str(nested)!r}).write_text(json.dumps(dict(
+            child=os.getpid(), grandchild=grandchild, session=os.getsid(0))))
+time.sleep(30)
+"""
     result = run_logged_process(
         [sys.executable, "-c", fixture],
         cwd=case_dir,
@@ -192,10 +199,13 @@ def run_fixture(root: Path) -> dict[str, object]:
         "observed_pids": result.observed_child_pids,
         "sentinel_unchanged": sentinel.read_text(encoding="utf-8") == "must-survive\n",
     }
+    record["nested"] = json.loads(nested.read_text())
+    record["remaining_active_groups"] = _session_groups(record["nested"]["session"])
     (case_dir / "result.json").write_text(json.dumps(record, indent=2) + "\n",
                                            encoding="utf-8")
     if (not result.timed_out or not result.term_sent or not result.kill_sent or
-            not result.orphan_group_reaped or not record["sentinel_unchanged"]):
+            not result.orphan_group_reaped or not record["sentinel_unchanged"] or
+            record["remaining_active_groups"]):
         raise RuntimeError(f"python watchdog fixture failed: {record}")
     return record
 

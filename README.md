@@ -11,6 +11,7 @@
 | 固定块缓冲池 | `SharedBufferPool` | 4/16KiB 共享内存缓冲区，通过 `BufferHandle` 跨进程传递 |
 
 SPSC 支持 POSIX shm、memfd + SCM_RIGHTS 和共享槽位的原地读写。
+可选 eventfd 通知将 SPSC 新样本提示接入应用的 epoll，与 timerfd、停止信号或其他 Linux FD 一起等待。
 缓冲池可与 `MpmcQueue<BufferHandle>` 组合：大块数据留在共享内存中，队列传递 88B 句柄。
 
 - **同步与所有权**：进程共享 futex、MPMC 生产/消费分侧 gate、RAII 管理共享缓冲区所有权；校验 schema、实例代次和进程身份。
@@ -52,6 +53,60 @@ target_link_libraries(app PRIVATE SelfIPCs::self_ipcs)
 ```
 
 使用示例见 [examples/consume_demo/](examples/consume_demo/)，覆盖 channel、queue+wait 和缓冲池句柄传递。
+
+### SPSC eventfd 通知
+
+默认 `publish()` / `wait_latest()` 继续使用共享内存和 futex。生产者调用
+`enable_event_notifications()` 后，消费者可调用 `event_notification(timeout)` 获取可移动的
+`EventNotification`。该功能适用于 1P1C latest-value 通道，两种共享内存 transport 均可使用。
+
+- **注册**：独立 Unix socket sidecar 通过 SCM_RIGHTS 传递同一个非阻塞、CLOEXEC eventfd；
+  校验同 UID、SO_PEERCRED、双方 PID/启动时间/boot-id、角色 epoch、schema、generation 和 nonce。
+  先挂接新注册，再发送初始提示，覆盖注册前及注册窗口内的发布。每次重新注册替换旧注册。
+- **等待**：`native_handle()` 是内部 epoll FD，聚合 eventfd 和控制连接关闭事件，可作为应用 epoll 的
+  `EPOLLIN` 监听项。采用 level-triggered 模式；收到提示后按 `drain()` → `try_read_latest()`
+  （或 `try_loan_latest()`）→ 再等待的顺序处理。提示可合并，样本序号与遗漏数由通道读取结果提供。
+  `drain()` 每次至多成功读取一次 eventfd 计数；发布与 drain 交错时，后续数据检查或保留的可读提示覆盖新值。
+- **生命周期**：保持 Consumer 存活，同一句柄串行操作。应用先 `EPOLL_CTL_DEL`，再销毁通知对象；
+  通知对象先移除内部 epoll 注册，再关闭各 FD。`disable_event_notifications()`、重新注册、consumer
+  关闭及 producer 退出使旧注册失效；producer 异常退出也通过控制连接关闭唤醒。重连后重新注册，
+  旧 FD 保留原实例绑定。fork 后通过 exec 创建独立句柄，示例包含完整的有界子进程回收。
+- **完成与错误**：数据原子提交后才写 eventfd，同时保留原 futex 唤醒。饱和 `EAGAIN` 表示已有提示；
+  `EINTR` 最多重试 8 次。提交成功保持 `publish()` / `WriteLoan::commit()` 成功，通知错误由
+  `event_notification_error()` 提供 errno，并关闭该注册的控制连接。`drain()` 的 `ProducerOffline`
+  或 `StaleHandle` 用于退出或重新注册处理；仍先检查通道中最后已提交的样本，再处理该状态。
+- **时限**：注册使用一个绝对 MONOTONIC 截止时间覆盖 connect/send/recvmsg/重试；默认 `1000ms`，
+  `0ms` 为一次 `20ms` 交换。服务端每 peer 独立预算 `100ms`，以 `10ms` 片段检查停止；
+  启用时的控制锁获取沿用原控制面语义，实际完成时间受系统调度影响。
+
+[examples/notification_demo/](examples/notification_demo/) 使用已安装包、真实 fork/exec 和独立 open，
+演示注册前/后的发布，以及通知、timerfd、stop eventfd 的统一 epoll 等待：
+
+```bash
+cmake -S examples/notification_demo -B /tmp/selfipcs-notification-demo \
+  -DCMAKE_PREFIX_PATH=/your/prefix
+cmake --build /tmp/selfipcs-notification-demo
+ctest --test-dir /tmp/selfipcs-notification-demo --output-on-failure
+# 旧包和头入口：在另一个构建目录增加 -DSELFIPCS_DEMO_USE_LEGACY=ON
+```
+
+比较工具 `self_ipcs_shm_bench` 及其 producer/consumer 支持 `--notification futex|eventfd`，默认 futex。
+驱动在相同 payload、CPU、节拍、预热和采样目标下替换 SHM 等待方式，保留 Socket 与 poll 对照：
+两种等待方式都通过继承的启动 socket 握手，在消费者完成注册和 CSV 准备后开始发布；每个运行使用独立通道名。
+
+```bash
+build/selfipcs-release/tools/self_ipcs_shm_bench --smoke --notification eventfd --list
+build/selfipcs-release/tools/self_ipcs_shm_bench --smoke --notification eventfd \
+  --only smoke-shm-eventfd-64B-same-100-controlled --out-dir /absolute/path/to/new-evidence
+```
+
+每次采集使用独立输出目录；下面的历史性能表保留 2026-10-13 的 futex 配置与采集版本。
+
+2026-10-21 Linux 虚拟机验证覆盖注册前/中发布、drain 交错、通知合并、EINTR、eventfd 饱和、
+提交后通知失败、旧 FD 替换、进程退出和实例重建。Debug 完成 252 项启用测试，ASan/UBSan
+完成 80 项相关测试（`detect_leaks=0`）；Release 的新旧包与混合入口完成 6 组独立安装消费，
+ASan/UBSan 的新旧通知示例完成 2 组。比较入口以相同条件的 50 样本 smoke 校验启动握手、
+序号及分位数，eventfd 的正式性能采集单独进行。
 
 ### 新入口与兼容
 

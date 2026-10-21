@@ -65,6 +65,7 @@ selfipcs_tool(edge_shm_supervisor self_ipcs_shm_supervisor)
 selfipcs_tool(edge_crash_matrix self_ipcs_crash_matrix)
 
 selfipcs_tool(edge_shm_bench self_ipcs_shm_bench)
+target_sources(edge_shm_bench PRIVATE src/bench_child.cpp)
 selfipcs_tool(edge_shm_bench_producer self_ipcs_shm_bench_producer)
 selfipcs_tool(edge_shm_bench_consumer self_ipcs_shm_bench_consumer)
 selfipcs_tool(edge_shm_bench_sock self_ipcs_shm_bench_sock)
@@ -169,6 +170,16 @@ if(BUILD_TESTING)
   set_tests_properties(buffer_pool_bench_smoke PROPERTIES TIMEOUT 120 LABELS benchmark)
 
   if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME event_notification_bench_regression
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_event_notification_bench.py
+              --driver $<TARGET_FILE:edge_shm_bench>
+              --producer $<TARGET_FILE:edge_shm_bench_producer>
+              --consumer $<TARGET_FILE:edge_shm_bench_consumer>
+              --output-root ${CMAKE_BINARY_DIR})
+    set_tests_properties(event_notification_bench_regression PROPERTIES
+      TIMEOUT 60 LABELS benchmark ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
+
     add_test(
       NAME formal_benchmark_metadata_regression
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_formal_bench.py)

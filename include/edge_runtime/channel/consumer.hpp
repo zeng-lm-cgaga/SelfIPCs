@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "edge_runtime/channel/channel_options.hpp"
+#include "edge_runtime/channel/event_notification.hpp"
 #include "edge_runtime/common/error.hpp"
 #include "edge_runtime/channel/loan.hpp"
 #include "edge_runtime/common/result.hpp"
@@ -129,6 +130,15 @@ class Consumer {
 	// 针对已替换实例重新打开并更新句柄资源。
 	Result<ReconnectInfo> reconnect() noexcept {
 		return detail::consumer_reconnect_impl(handle_);
+	}
+	Result<EventNotification> event_notification(
+	        std::chrono::milliseconds timeout = std::chrono::milliseconds{1000}) {
+		if (timeout.count() < 0) {
+			return make_error(ErrorCode::kInvalidOptions, "Consumer::event_notification",
+			                  "negative timeout");
+		}
+		return detail::consumer_event_notification_impl(
+		        handle_, static_cast<uint64_t>(timeout.count()));
 	}
 	// 慢路径诊断：重新确认名称与实例绑定关系后读取通道状态。
 	Result<ChannelStatus> status() const noexcept {

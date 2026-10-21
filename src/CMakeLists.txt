@@ -4,6 +4,7 @@ add_library(self_ipcs STATIC
   edge_runtime/channel/channel_layout.cpp
   edge_runtime/channel/channel_observer.cpp
   edge_runtime/channel/consumer_impl.cpp
+  edge_runtime/channel/event_notification.cpp
   edge_runtime/channel/control_lock.cpp
   edge_runtime/channel/loan.cpp
   edge_runtime/channel/producer_impl.cpp
@@ -14,6 +15,7 @@ add_library(self_ipcs STATIC
   edge_runtime/process/process_spawn.cpp
   edge_runtime/process/supervisor_impl.cpp
   edge_runtime/transport/fd_broker.cpp
+  edge_runtime/transport/socket_io.cpp
   edge_runtime/transport/shm_object.cpp
   edge_runtime/sync/clock.cpp
   edge_runtime/sync/futex.cpp

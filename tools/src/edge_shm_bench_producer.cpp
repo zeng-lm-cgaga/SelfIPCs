@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "edge_runtime_tool/bench_notification.hpp"
 #include "edge_runtime_tool/bench_payload.hpp"
 #include "edge_runtime/channel/channel_options.hpp"
 #include "edge_runtime/channel/channel_layout.hpp"
@@ -30,6 +31,8 @@ struct Args {
 	uint64_t max_time_ms = 60000;
 	uint64_t rate_hz = 0;
 	uint64_t wait_consumer_ms = 0;
+	int ready_fd = -1;
+	edge_tool::BenchNotification notification = edge_tool::BenchNotification::kFutex;
 	bool checksum = true;
 };
 
@@ -48,9 +51,25 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 		std::fflush(stdout);
 		return 2;
 	}
+	if (a.notification == edge_tool::BenchNotification::kEventfd) {
+		auto enabled = p.value().enable_event_notifications();
+		if (!enabled) {
+			const auto& error = enabled.error();
+			std::printf("NOTIFICATION_ENABLE_FAIL code=%s errno=%d op=%s ctx=%s\n",
+			            edge_runtime::to_string(error.code), error.errno_value,
+			            error.operation, error.context);
+			std::fflush(stdout);
+			return 2;
+		}
+	}
 	std::printf("READY generation=%" PRIu64 "\n", p.value().generation());
 	std::fflush(stdout);
-	if (a.wait_consumer_ms > 0) {
+	if (a.ready_fd >= 0) {
+		if (!edge_tool::bench_wait_ready(a.ready_fd, a.wait_consumer_ms > 0 ? a.wait_consumer_ms : 5000)) {
+			std::printf("WAIT_READY_FAIL code=TimeoutOrDisconnected\n");
+			return 2;
+		}
+	} else if (a.wait_consumer_ms > 0) {
 		const int64_t wait_deadline = edge_tool::monotonic_ms_now() +
 		                              static_cast<int64_t>(a.wait_consumer_ms);
 		for (;;) {
@@ -101,6 +120,15 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 	}
 
 	const uint64_t end_cpu = cpu_us_now();
+	if (a.notification == edge_tool::BenchNotification::kEventfd) {
+		const int notification_error = p.value().event_notification_error();
+		if (notification_error != 0) {
+			std::printf("NOTIFICATION_DELIVERY_FAIL errno=%d published=%" PRIu64 "\n",
+			            notification_error, published);
+			std::fflush(stdout);
+			return 3;
+		}
+	}
 	std::printf("DONE published=%" PRIu64 " cpu_us=%" PRIu64 "\n", published,
 	            end_cpu - start_cpu);
 	std::fflush(stdout);
@@ -115,7 +143,7 @@ int main(int argc, char** argv) {
 		std::fprintf(stderr,
 		             "usage: self_ipcs_shm_bench_producer --name <name> --payload <bytes> "
 		             "[--samples N] [--max-time-ms T] [--rate hz] "
-		             "[--wait-consumer-ms N] [--checksum 1]\n");
+		             "[--wait-consumer-ms N] [--notification futex|eventfd] [--ready-fd FD] [--checksum 1]\n");
 		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 	Args a;
@@ -125,6 +153,8 @@ int main(int argc, char** argv) {
 	a.max_time_ms = edge_tool::arg_u64(argc, argv, "--max-time-ms", 60000);
 	a.rate_hz = edge_tool::arg_u64(argc, argv, "--rate", 0);
 	a.wait_consumer_ms = edge_tool::arg_u64(argc, argv, "--wait-consumer-ms", 0);
+	a.notification = edge_tool::bench_notification_from_args(argc, argv);
+	a.ready_fd = edge_tool::bench_ready_fd_from_args(argc, argv);
 	a.checksum = edge_tool::mandatory_payload_checksum(argc, argv);
 
 	const edge_runtime::SchemaDescriptor schema{bench::bench_fingerprint(a.payload), 1,
