@@ -26,6 +26,7 @@ struct ChildHandle {
 	bool valid() const { return pid > 0 && pipe_read >= 0; }
 };
 ChildHandle spawn_child(const std::vector<std::string>& arguments, int inherited_fd = -1);
-ChildResult collect_child(ChildHandle handle, int64_t deadline_ms = 0);
+int64_t worker_deadline_ms(uint64_t work_budget_ms, int64_t now_ms) noexcept;
+ChildResult collect_child(ChildHandle handle, int64_t deadline_ms);
 }
 #endif

@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <limits>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -15,6 +16,18 @@
 #include "edge_runtime_tool/tool_common.hpp"
 
 namespace edge_tool {
+int64_t worker_deadline_ms(uint64_t work_budget_ms, int64_t now_ms) noexcept {
+	constexpr int64_t startup_grace_ms = 17'000;
+	const int64_t start = now_ms > 0 ? now_ms : 0;
+	const int64_t limit = std::numeric_limits<int64_t>::max();
+	const uint64_t work = work_budget_ms == 0 ? 60'000 : work_budget_ms;
+	const uint64_t available = static_cast<uint64_t>(limit - start);
+	if (work >= available || available - work < static_cast<uint64_t>(startup_grace_ms)) {
+		return limit;
+	}
+	return start + static_cast<int64_t>(work) + startup_grace_ms;
+}
+
 ChildHandle spawn_child(const std::vector<std::string>& arguments, int inherited_fd) {
 	std::vector<char*> pointers;
 	for (const auto& argument : arguments) pointers.push_back(const_cast<char*>(argument.c_str()));

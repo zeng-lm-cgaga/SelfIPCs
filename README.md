@@ -101,6 +101,8 @@ build/selfipcs-release/tools/self_ipcs_shm_bench --smoke --notification eventfd 
 ```
 
 每次采集使用独立输出目录；下面的历史性能表保留 2026-10-13 的 futex 配置与采集版本。
+每轮 SHM（futex/eventfd/poll）或 Socket 的两个 worker 共用一个绝对截止时间：工作预算加 `17s` 启动余量，
+覆盖输出排空和进程退出；超时后清理该 worker 进程组并将运行标记为失败。
 
 2026-10-21 Linux 虚拟机验证覆盖注册前/中发布、drain 交错、通知合并、EINTR、eventfd 饱和、
 提交后通知失败、旧 FD 替换、进程退出和实例重建。Debug 完成 252 项启用测试，ASan/UBSan

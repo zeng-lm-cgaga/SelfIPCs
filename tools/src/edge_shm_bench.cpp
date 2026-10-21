@@ -33,7 +33,6 @@ using edge_tool::arg_value;
 
 constexpr const char* kPerfEventParanoidPath = "/proc/sys/kernel/perf_event_paranoid";
 constexpr const char* kYamaPtraceScopePath = "/proc/sys/kernel/yama/ptrace_scope";
-constexpr int64_t kEventfdStartupGraceMs = 17000;
 
 struct RunSpec {
 	std::string id;
@@ -96,7 +95,8 @@ std::string read_sys_file(const char* path) {
 }
 
 ChildResult spawn_collect(const std::vector<std::string>& argv) {
-	return collect_child(spawn_child(argv));
+	const int64_t deadline = edge_tool::worker_deadline_ms(0, edge_tool::monotonic_ms_now());
+	return collect_child(spawn_child(argv), deadline);
 }
 
 uint64_t rusage_cpu_us(const struct rusage& ru) {
@@ -659,11 +659,7 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	write_command(spec, dir, pargv, cargv);
 
 	const int64_t child_deadline_ms =
-	        spec.notification == edge_tool::BenchNotification::kEventfd
-	                ? edge_tool::monotonic_ms_now() +
-	                          static_cast<int64_t>(spec.max_time_ms > 0 ? spec.max_time_ms : 60000) +
-	                          kEventfdStartupGraceMs
-	                : 0;
+	        edge_tool::worker_deadline_ms(spec.max_time_ms, edge_tool::monotonic_ms_now());
 	const ChildHandle ph = spawn_child(pargv, startup.reader());
 	const ChildHandle ch = spawn_child(cargv, startup.writer());
 	startup.close();
@@ -798,10 +794,12 @@ RunOutcome run_socket(const Config& cfg, const RunSpec& spec) {
 
 	write_command(spec, dir, pargv, cargv);
 
+	const int64_t child_deadline_ms =
+	        edge_tool::worker_deadline_ms(spec.max_time_ms, edge_tool::monotonic_ms_now());
 	const ChildHandle ph = spawn_child(pargv);
 	const ChildHandle ch = spawn_child(cargv);
-	ChildResult prod = collect_child(ph);
-	ChildResult cons = collect_child(ch);
+	ChildResult prod = collect_child(ph, child_deadline_ms);
+	ChildResult cons = collect_child(ch, child_deadline_ms);
 	::unlink(sock_path.c_str());
 
 	const ProducerMarkers pm = parse_producer(prod.out);

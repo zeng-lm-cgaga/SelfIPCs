@@ -4,12 +4,28 @@
 #include <poll.h>
 #include <signal.h>
 
+#include <limits>
+
 #include "edge_runtime_tool/bench_child.hpp"
 #include "edge_runtime_tool/tool_common.hpp"
 
 namespace {
 using edge_tool::spawn_child;
 using edge_tool::collect_child;
+TEST(NotificationBenchDriver, SharedDeadlineIncludesWorkAndStartupBudget) {
+	EXPECT_EQ(edge_tool::worker_deadline_ms(2000, 1000), 20'000);
+	EXPECT_EQ(edge_tool::worker_deadline_ms(60'000, 1000), 78'000);
+	EXPECT_EQ(edge_tool::worker_deadline_ms(0, 1000), 78'000);
+}
+
+TEST(NotificationBenchDriver, WorkerDeadlineSaturatesWithoutSignedOverflow) {
+	const auto limit = std::numeric_limits<int64_t>::max();
+	EXPECT_EQ(edge_tool::worker_deadline_ms(UINT64_MAX, 1000), limit);
+	EXPECT_EQ(edge_tool::worker_deadline_ms(2000, limit - 1000), limit);
+	EXPECT_EQ(edge_tool::worker_deadline_ms(2000, -1), 19'000);
+	EXPECT_EQ(edge_tool::worker_deadline_ms(1, 0), 17'001);
+}
+
 TEST(NotificationBenchDriver, ExpiredBudgetPreservesAlreadyFinishedOutput) {
 	const auto child = spawn_child({"/bin/sh", "-c", "printf 'SUMMARY finished=1\\n'"});
 	ASSERT_TRUE(child.valid());
