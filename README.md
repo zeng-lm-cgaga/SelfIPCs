@@ -151,6 +151,7 @@ cmake --build /tmp/selfipcs-async-demo
 `examples/mixed_io_demo/` 将 SPSC 聚合通知 FD、SocketCAN、timerfd 和停止 eventfd 放在同一个
 level-triggered epoll 消费循环中。每轮按有界批次处理各来源，先读取最终样本再处理终止状态，
 移除 epoll 监听后关闭 FD。示例接受专用 CAN 接口，通过真实 `fork/exec` 独立打开通道。
+通道通过 owner 校验接口释放，控制 journal 按核心策略保留，供后续身份与恢复检查。
 vcan 场景、物理 CAN 硬件和正式性能分别记录对应运行环境。
 
 ```bash

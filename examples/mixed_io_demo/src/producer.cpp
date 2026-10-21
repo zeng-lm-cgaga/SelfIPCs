@@ -5,7 +5,6 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -34,7 +33,8 @@ class ChannelOwner {
 		const auto removed = producer_.remove_if_owner();
 		if (!disabled) (void)api_error("disable notifications", disabled.error());
 		if (!removed) (void)api_error("remove own channel", removed.error());
-		std::printf("{\"event\":\"channel_cleanup\",\"disabled\":%s,\"removed\":%s}\n",
+		std::printf("{\"event\":\"channel_cleanup\",\"disabled\":%s,\"removed\":%s,"
+		            "\"control_journal_retained\":true}\n",
 		            disabled ? "true" : "false", removed ? "true" : "false");
 		return disabled && removed;
 	}
@@ -42,37 +42,6 @@ class ChannelOwner {
        private:
 	Producer& producer_;
 	bool active_{true};
-};
-
-struct LockIdentity {
-	std::string path;
-	struct stat identity {};
-	bool captured{false};
-
-	bool capture(const std::string& name) {
-		path = "/run/user/" + std::to_string(::getuid()) + "/edgeruntime/" + name + ".lock";
-		captured = ::lstat(path.c_str(), &identity) == 0 && S_ISREG(identity.st_mode) &&
-		           identity.st_uid == ::geteuid() && identity.st_nlink == 1;
-		if (!captured) std::fprintf(stderr, "cannot capture unique channel lock identity\n");
-		return captured;
-	}
-
-	bool remove() const {
-		if (!captured) return true;
-		struct stat current {};
-		if (::lstat(path.c_str(), &current) != 0) {
-			if (errno == ENOENT) return true;
-			return system_error("stat own lock for cleanup");
-		}
-		if (current.st_dev != identity.st_dev || current.st_ino != identity.st_ino ||
-		    current.st_uid != identity.st_uid || current.st_nlink != 1) {
-			std::fprintf(stderr, "lock identity changed; refusing cleanup\n");
-			return false;
-		}
-		const bool removed = ::unlink(path.c_str()) == 0;
-		std::printf("{\"event\":\"lock_cleanup\",\"removed\":%s}\n", removed ? "true" : "false");
-		return removed || system_error("unlink own unique lock");
-	}
 };
 
 bool emit_can(int descriptor, uint32_t can_id, uint32_t& sequence, uint64_t& backpressure,
@@ -99,7 +68,7 @@ bool emit_can(int descriptor, uint32_t can_id, uint32_t& sequence, uint64_t& bac
 	return true;
 }
 
-bool session(Options options, LockIdentity& lock) {
+bool session(Options options) {
 	options.channel = "mixio." + std::to_string(::getpid()) + "." + std::to_string(monotonic_ns());
 	options.can_id = 0x400U + static_cast<uint32_t>(::getpid()) % 0x3ffU;
 	Descriptor can(open_can(options, false));
@@ -139,7 +108,6 @@ bool session(Options options, LockIdentity& lock) {
 	if (!created) return api_error("create unique channel", created.error());
 	Producer producer = std::move(created.value());
 	ChannelOwner owner(producer);
-	if (!lock.capture(options.channel)) return false;
 	const auto enabled = producer.enable_event_notifications();
 	if (!enabled) return api_error("enable event notifications", enabled.error());
 	const auto startup_deadline = Clock::now() + 3s;
@@ -202,10 +170,7 @@ bool session(Options options, LockIdentity& lock) {
 }
 
 bool run_producer(const Options& options) {
-	LockIdentity lock;
-	const bool result = session(options, lock);
-	if (!result) return false;
-	return lock.remove();
+	return session(options);
 }
 
 }
