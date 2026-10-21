@@ -104,7 +104,8 @@ build/selfipcs-release/tools/self_ipcs_shm_bench --smoke --notification eventfd 
 每轮 SHM（futex/eventfd/poll）或 Socket 的两个 worker 共用一个绝对截止时间：工作预算加 `17s` 启动余量，
 覆盖输出排空和进程退出；超时后清理该 worker 进程组并将运行标记为失败。
 
-2026-10-21 Linux 虚拟机验证覆盖注册前/中发布、drain 交错、通知合并、EINTR、eventfd 饱和、
+2026-10-21 Linux 虚拟机上的 eventfd 基础版本 `cd9256f`（工具修正 `58c0551`）验证覆盖
+注册前/中发布、drain 交错、通知合并、EINTR、eventfd 饱和、
 提交后通知失败、旧 FD 替换、进程退出和实例重建。Debug 完成 252 项启用测试，ASan/UBSan
 完成 80 项相关测试（`detect_leaks=0`）；Release 的新旧包与混合入口完成 6 组独立安装消费，
 ASan/UBSan 的新旧通知示例完成 2 组。比较入口以相同条件的 50 样本 smoke 校验启动握手、
@@ -188,11 +189,64 @@ UAPI 在 `kernel/notification/include/uapi/`：`read` / `write` 使用本机字�
 `scripts/verify_notification_matrix.py` 固定 64B、100/1000Hz、同核/跨核、futex/eventfd 各三轮，
 保存 raw worker、CSV、工作区间及完整进程生命周期 CPU。正式采集与完整场景/竞态验收在功能集成后统一执行。
 
+### 队列关闭、批量与 Pool 等待
+
+MPMC 和 SharedBufferPool 新建实例使用 **ABI 3.0**；新旧库在 `open` 时按 major 显式拒绝
+ABI 2.0/3.0 混用，返回 `AbiMismatch`。升级时先由原 creator 按所有权排空、释放并移除旧实例，
+再创建新实例。SPSC 布局、`BufferHandle` 的 88B 结构、共享对象命名和身份校验沿用现有契约。
+
+- **全局关闭**：仅队列 creator 进程的匹配身份可以调用 `close()`。关闭与 push 共用 enqueue gate：
+  已获 gate 的 push 完整提交后，close 才能提交关闭；之后的 push 返回 `Closed`。close 遇到活动 gate
+  返回现有的 `QueueContention` / `ConcurrentHandleUse`，由应用选择有界重试；死亡或身份不明继续
+  `RecoveryBlocked`。close 成功唤醒等待方，已提交元素继续 FIFO pop，排空后返回 `Closed`。
+  析构只释放本地句柄，`remove_if_creator()` 负责按身份删除实例，三者分别调用。
+- **单次等待取消**：C++17 `CancellationSource` / `CancellationToken` 使用进程本地共享状态；复制的
+  source/token 共享一次性取消，token 保持状态存活；source 析构只释放引用，重新开始使用新的 source。其他普通线程可调用
+  `request_cancel()`；信号处理与跨进程传递使用各自的应用层通知。fork 后独立 open 句柄，exec 后
+  创建本进程 token。新增错误 `Closed`、`Cancelled` 追加在既有错误码之后。
+- **等待结果**：`wait_push_until(value, deadline, token)`、`wait_pop_until(deadline, token)` 和
+  `wait_acquire_write_until(deadline, token)` 使用单一 steady-clock 绝对时限。每次唤醒、超时和取消
+  都重新检查实际操作；已提交/取得的数据优先成功，永久错误与 `Closed` 优先于取消，仍需等待时
+  `Cancelled` 优先于 `Timeout`。每轮以实际尝试为判定点，随后发生的并发发布留待下一次操作。
+  等待期间保持句柄、输出和执行线程的对象存活。
+- **有界批量**：`try_push_batch(values, count, token)` / `try_pop_batch(values, count, token)`
+  返回 `BatchResult{count, reason, error}`，最多 256 个元素，零长度完成。成功前缀始终保留，
+  `reason` 区分 Complete、Full、Empty、Closed、Cancelled、Contention、Error；`error` 在提前终止时有效。
+  每个元素独立提交、释放 gate 并通知，其他批次可以交错，FIFO 顺序按成功入队元素定义。
+  批次在开始下个元素前检查取消；成功前缀仍可消费，整批原子性由应用层组合协议提供。
+- **等待空闲块**：Pool 返回 RAII `WriteBuffer`，合法 abort/归还先发布 FREE 再通知全部等待者。
+  注册、epoch 快照、复查和 futex 等待覆盖检查到入睡的窗口；睡眠只保留句柄与取消注册，
+  池控制锁和待归还块可供其他参与方使用。
+  进程退出、代次不符与所有权不明沿原 fail-closed 路径处理。
+
+### 可选本地诊断
+
+队列与 Pool 句柄通过 `set_diagnostics_enabled(true)` 开启，默认关闭；`diagnostics()` 返回
+`DiagnosticsSnapshot`，`reset_diagnostics()` 在句柄静止时清零。移动转移同一份统计状态，独立 open
+各自计数；并发启停与快照使用本地原子，快照逐项读取。计数达到 `UINT64_MAX` 后饱和。
+
+`push/pop/acquire_attempts` 包含 wait/batch 的内部尝试，successes 按成功元素/块计数；`wait_calls`
+和 `batch_calls` 按外层调用计数，`waits` 为实际 futex 调用，Full/Empty/contention 为尝试结果，
+timeouts/cancelled 为等待退出或批量取消，notifications 为本句柄发布的队列/Pool 唤醒提示。
+capacity 是实例固定容量；并发在用量按原 status 观察，快照字段是分时观察值。
+统计 off/on 开销与单条/批量性能对照在集中验收阶段按相同配置采集。
+
+独立 C++17 示例通过真实 fork/exec 与独立 open 演示容量等待、取消、批量前缀、关闭排空和 Pool
+归还唤醒，并打印每个句柄的计数：
+
+```bash
+cmake -S examples/queue_pool_demo -B /tmp/selfipcs-queue-pool-demo \
+  -DCMAKE_PREFIX_PATH=/your/prefix
+cmake --build /tmp/selfipcs-queue-pool-demo
+/tmp/selfipcs-queue-pool-demo/queue_pool_demo
+# 旧包/头入口：另建目录并增加 -DSELFIPCS_DEMO_USE_LEGACY=ON
+```
+
 ### 新入口与兼容
 
 公共头按 `self_ipcs/{common,channel,queue,buffer,process}/` 划分，例如 `#include <self_ipcs/queue/mpmc_queue.hpp>`，C++ 使用 `self_ipcs::MpmcQueue<T>`。`self_ipcs` 是原实现命名空间的 alias，新旧入口共用 `libself_ipcs.a`，保留原有链接符号与进程间协议。
 
-已有工程可继续使用 `find_package(EdgeRuntime CONFIG REQUIRED)`、`EdgeRuntime::edge_runtime`、`edge_runtime/...` 头路径和 `edge_runtime::`。工具安装同时提供 `self_ipcs_*` 名称和对应的 `edge_*` 兼容入口；共享内存标识、ABI 版本及实例校验保持原值。
+已有工程可继续使用 `find_package(EdgeRuntime CONFIG REQUIRED)`、`EdgeRuntime::edge_runtime`、`edge_runtime/...` 头路径和 `edge_runtime::`。工具安装同时提供 `self_ipcs_*` 名称和对应的 `edge_*` 兼容入口；SPSC 协议保持原值，MPMC/Pool 使用上述 ABI 3.0 版本边界。
 
 源码构建支持 `cmake --build <build-dir> --target self_ipcs` 和 `--target edge_runtime`；两种目标及源码内链接入口共用同一份核心编译产物 `libself_ipcs.a`。
 
