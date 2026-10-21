@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <chrono>
+#include <csignal>
+#include <iostream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -34,7 +37,18 @@ class PoolWaitFeatureTest : public ::testing::Test {
 		options_.schema = SharedBufferPoolTestSchema();
 	}
 
-	void TearDown() override { (void)::shm_unlink(shm_name().c_str()); }
+	void TearDown() override {
+		auto opened = SharedBufferPool::open(options_);
+		if (!opened && opened.error().code == ErrorCode::kNotFound) return;
+		ASSERT_TRUE(opened);
+		auto removed = opened.value().remove_if_creator();
+		if (preserve_protocol_fault_ && !removed &&
+		    removed.error().code == ErrorCode::kRecoveryBlocked) {
+			std::cout << "retained owned protocol-fault fixture=" << shm_name() << '\n';
+			return;
+		}
+		EXPECT_TRUE(removed);
+	}
 
 	std::string shm_name() const {
 		return "/edgeruntime.bufferpool." + std::to_string(::getuid()) + "." +
@@ -63,6 +77,7 @@ class PoolWaitFeatureTest : public ::testing::Test {
 	}
 
 	SharedBufferPoolOptions options_;
+	bool preserve_protocol_fault_{false};
 };
 
 TEST_F(PoolWaitFeatureTest, DiagnosticsAreLocalDisabledByDefaultAndMoveWithHandle) {
@@ -141,6 +156,9 @@ TEST_F(PoolWaitFeatureTest, SuccessWinsAndCancellationPrecedesTimeout) {
 	EXPECT_EQ(snapshot.timeouts, 1u);
 	EXPECT_GE(snapshot.waits, 1u);
 	EXPECT_EQ(snapshot.acquire_attempts, snapshot.full + snapshot.contention + 1u);
+	auto read = pool.acquire_read(published.value());
+	ASSERT_TRUE(read);
+	read.value().release();
 }
 
 TEST_F(PoolWaitFeatureTest, AbortWakesAnIndependentlyOpenedHandle) {
@@ -202,7 +220,8 @@ TEST_F(PoolWaitFeatureTest, RegisteredCancellationWakesWithoutCountingAFreeNotif
 	auto& pool = created.value();
 	auto write = pool.try_acquire_write();
 	ASSERT_TRUE(write);
-	ASSERT_TRUE(write.value().publish());
+	auto descriptor = write.value().publish();
+	ASSERT_TRUE(descriptor);
 	pool.set_diagnostics_enabled(true);
 	CancellationSource source;
 	ErrorCode reason = ErrorCode::kSystemError;
@@ -220,6 +239,9 @@ TEST_F(PoolWaitFeatureTest, RegisteredCancellationWakesWithoutCountingAFreeNotif
 	EXPECT_EQ(pool.diagnostics().timeouts, 0u);
 	EXPECT_EQ(pool.diagnostics().notifications, 0u);
 	EXPECT_TRUE(SharedBufferPool::open(options_));
+	auto read = pool.acquire_read(descriptor.value());
+	ASSERT_TRUE(read);
+	read.value().release();
 }
 
 TEST_F(PoolWaitFeatureTest, RollbackNotifiesAndPermanentErrorsWinWithAbiTwoRejected) {
@@ -254,6 +276,7 @@ TEST_F(PoolWaitFeatureTest, RollbackNotifiesAndPermanentErrorsWinWithAbiTwoRejec
 	EXPECT_EQ(pool.diagnostics().waits, 0u);
 	EXPECT_TRUE(SharedBufferPool::open(options_));
 	shared_store_seq_cst(&block->block_generation, uint64_t{0});
+	preserve_protocol_fault_ = true;
 	shared_store_seq_cst(&block->owner_epoch, uint64_t{1});
 	auto fault = pool.wait_acquire_write_until(std::chrono::steady_clock::now() - 1ms,
 	                                           source.token());
@@ -297,14 +320,35 @@ TEST_F(PoolWaitFeatureTest, InheritedHandlesCannotClaimPublishFreeOrRemoveParent
 		::_exit(rejected && reopened && reopened.value().status() ? 0 : 1);
 	}
 	int status = 0;
-	ASSERT_EQ(::waitpid(child, &status, 0), child);
+	bool finished = false;
+	const auto child_deadline = std::chrono::steady_clock::now() + 2s;
+	while (std::chrono::steady_clock::now() < child_deadline) {
+		const pid_t result = ::waitpid(child, &status, WNOHANG);
+		if (result == child) {
+			finished = true;
+			break;
+		}
+		if (result < 0 && errno != EINTR) break;
+		std::this_thread::sleep_for(1ms);
+	}
+	if (!finished) {
+		(void)::kill(child, SIGKILL);
+		while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+		}
+	}
+	ASSERT_TRUE(finished);
 	ASSERT_TRUE(WIFEXITED(status));
 	EXPECT_EQ(WEXITSTATUS(status), 0);
 	auto parent = pool.status();
 	ASSERT_TRUE(parent);
 	EXPECT_EQ(parent.value().writing_blocks, 1u);
 	EXPECT_EQ(parent.value().reading_blocks, 1u);
-	EXPECT_TRUE(write.value().publish());
+	auto parent_descriptor = write.value().publish();
+	ASSERT_TRUE(parent_descriptor);
+	auto final_read = pool.acquire_read(parent_descriptor.value());
+	ASSERT_TRUE(final_read);
+	final_read.value().release();
+	read.value().release();
 }
 
 }  // namespace
