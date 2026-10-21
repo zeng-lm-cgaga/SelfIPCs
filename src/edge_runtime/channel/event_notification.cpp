@@ -1,5 +1,3 @@
-#include "edge_runtime/channel/notification_service.hpp"
-
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/epoll.h>
@@ -17,6 +15,8 @@
 
 #include "edge_runtime/channel/channel_abi.hpp"
 #include "edge_runtime/channel/consumer_impl.hpp"
+#include "edge_runtime/channel/notification_backend.hpp"
+#include "edge_runtime/channel/notification_service.hpp"
 #include "edge_runtime/channel/producer_impl.hpp"
 #include "edge_runtime/sync/clock.hpp"
 #include "edge_runtime/transport/fd_broker.hpp"
@@ -102,16 +102,6 @@ bool epoll_add(int epoll_fd, int fd, uint64_t token) noexcept {
 	return ::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) == 0;
 }
 
-bool is_eventfd(int fd) noexcept {
-	char path[64]{};
-	char target[64]{};
-	std::snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-	const ssize_t size = ::readlink(path, target, sizeof(target) - 1);
-	const int flags = ::fcntl(fd, F_GETFL);
-	return size > 0 && std::strcmp(target, "anon_inode:[eventfd]") == 0 &&
-	       flags >= 0 && (flags & O_NONBLOCK) != 0;
-}
-
 Error system_error(const char* context) noexcept {
 	return make_errno_error(ErrorCode::kTransportFailed, errno, kOperation, context);
 }
@@ -124,17 +114,7 @@ uint64_t notification_checksum(NotificationRecord record) noexcept {
 }
 
 Result<void> eventfd_signal(int fd) noexcept {
-	const uint64_t value = 1;
-	for (int attempt = 0; attempt < 8; ++attempt) {
-		const ssize_t count = ::write(fd, &value, sizeof(value));
-		if (count == static_cast<ssize_t>(sizeof(value))) return Result<void>::ok();
-		if (count < 0 && errno == EAGAIN) return Result<void>::ok();
-		if (count < 0 && errno == EINTR) continue;
-		if (count >= 0) errno = EIO;
-		return system_error("eventfd write failed");
-	}
-	errno = EINTR;
-	return system_error("eventfd write interrupted repeatedly");
+	return notification_signal(fd, NotificationBackend::kEventFd);
 }
 
 struct NotificationSession {
@@ -145,6 +125,17 @@ struct NotificationSession {
 };
 
 Result<std::shared_ptr<NotificationServer>> NotificationServer::start(ProducerHandle& handle) {
+	return start(handle, NotificationBackend::kEventFd);
+}
+
+Result<std::shared_ptr<NotificationServer>> NotificationServer::start(ProducerHandle& handle,
+                                                                      NotificationBackend backend) {
+	if (!notification_backend_valid(backend))
+		return make_error(ErrorCode::kInvalidOptions, kOperation, "unknown backend");
+	if (backend == NotificationBackend::kDriver) {
+		auto checked = notification_open(backend);
+		if (!checked) return checked.error();
+	}
 	auto lock = ControlLock::acquire(channel_lock_path(handle.channel_name));
 	if (!lock) return lock.error();
 	auto journal = lock.value().read_journal();
@@ -165,6 +156,7 @@ Result<std::shared_ptr<NotificationServer>> NotificationServer::start(ProducerHa
 		return make_error(ErrorCode::kStaleHandle, kOperation, "channel broker removed");
 	}
 	auto server = std::shared_ptr<NotificationServer>(new NotificationServer);
+	server->backend_ = backend;
 	auto* base = static_cast<std::byte*>(handle.shm.mapping.get());
 	server->bootstrap_ = reinterpret_cast<BootstrapHeaderAbi*>(base);
 	server->header_ = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
@@ -214,7 +206,7 @@ void NotificationServer::stop() noexcept {
 void NotificationServer::notify() noexcept {
 	auto session = std::atomic_load(&session_);
 	if (!session) return;
-	auto signalled = eventfd_signal(session->event.get());
+	auto signalled = notification_signal(session->event.get(), backend_);
 	if (!signalled) {
 		last_error_.store(signalled.error().errno_value, std::memory_order_relaxed);
 		(void)::shutdown(session->peer.get(), SHUT_RDWR);
@@ -239,10 +231,17 @@ void NotificationServer::accept_peer(int fd) noexcept {
 	NotificationRecord request{};
 	if (!socket_io::peer_is_same_uid(fd) ||
 	    !socket_io::recv_full(fd, &request, sizeof(request), budget) ||
-	    request.magic != kNotificationMagic || request.version != 1 || request.kind != 1 ||
-	    (request.registration_hi == 0 && request.registration_lo == 0) ||
+	    request.magic != kNotificationMagic || (request.version != 1 && request.version != 2) ||
+	    request.kind != 1 || (request.registration_hi == 0 && request.registration_lo == 0) ||
 	    request.checksum != notification_checksum(request) || !binding_current(request) ||
-	    !peer_matches(fd, request.consumer.identity)) return;
+	    !peer_matches(fd, request.consumer.identity))
+		return;
+	if (request.version != static_cast<uint32_t>(backend_)) {
+		request.kind = 3;
+		request.checksum = notification_checksum(request);
+		(void)socket_io::send_full(fd, &request, sizeof(request), budget);
+		return;
+	}
 	std::shared_ptr<NotificationSession> session;
 	try {
 		session = std::make_shared<NotificationSession>();
@@ -251,14 +250,18 @@ void NotificationServer::accept_peer(int fd) noexcept {
 		return;
 	}
 	session->record = request;
-	session->event.reset(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
-	if (session->event.get() < 0) {
-		last_error_.store(errno, std::memory_order_relaxed);
+	auto descriptor = notification_open(backend_);
+	if (!descriptor) {
+		last_error_.store(descriptor.error().errno_value, std::memory_order_relaxed);
+		request.kind = 4;
+		request.checksum = notification_checksum(request);
+		(void)socket_io::send_full(fd, &request, sizeof(request), budget);
 		return;
 	}
+	session->event = std::move(descriptor.value());
 	session->peer = std::move(peer);
 	replace_session(session);
-	auto initial = eventfd_signal(session->event.get());
+	auto initial = notification_signal(session->event.get(), backend_);
 	if (!initial) {
 		last_error_.store(initial.error().errno_value, std::memory_order_relaxed);
 		replace_session({});
@@ -297,6 +300,7 @@ void NotificationServer::run() noexcept {
 struct EventNotificationState {
 	std::shared_ptr<ConsumerHandle> consumer;
 	NotificationRecord record{};
+	NotificationBackend backend{NotificationBackend::kEventFd};
 	UniqueFd event;
 	UniqueFd peer;
 	UniqueFd epoll;
@@ -335,6 +339,14 @@ Result<void> validate_state(const EventNotificationState& state) noexcept {
 
 Result<EventNotification> consumer_event_notification_impl(
         const std::shared_ptr<ConsumerHandle>& handle, uint64_t timeout_ms) {
+	return consumer_event_notification_impl(handle, timeout_ms, NotificationBackend::kEventFd);
+}
+
+Result<EventNotification> consumer_event_notification_impl(
+        const std::shared_ptr<ConsumerHandle>& handle, uint64_t timeout_ms,
+        NotificationBackend backend) {
+	if (!notification_backend_valid(backend))
+		return make_error(ErrorCode::kInvalidOptions, kOperation, "unknown backend");
 	if (!handle) return make_error(ErrorCode::kStaleHandle, kOperation, "empty consumer");
 	ConsumerUse use(*handle);
 	if (!use.acquired) return make_error(ErrorCode::kConcurrentHandleUse, kOperation);
@@ -346,11 +358,13 @@ Result<EventNotification> consumer_event_notification_impl(
 	if (budget.deadline_ns == 0) return make_error(ErrorCode::kClockAnomaly, kOperation);
 	auto state = std::make_shared<EventNotificationState>();
 	state->consumer = handle;
+	state->backend = backend;
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
 	auto request = snapshot(reinterpret_cast<BootstrapHeaderAbi*>(base),
 	                        reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset));
 	if (!request) return request.error();
 	state->record = request.value();
+	state->record.version = static_cast<uint32_t>(backend);
 	if (!same_role(state->record.consumer, NotificationRole{handle->role_epoch, handle->self}))
 		return make_error(ErrorCode::kStaleHandle, kOperation, "consumer ownership changed");
 	auto valid = validate_state(*state);
@@ -378,11 +392,24 @@ Result<EventNotification> consumer_event_notification_impl(
 				return make_error(ErrorCode::kPermissionDenied, kOperation, "producer peer identity mismatch");
 			NotificationRecord reply{};
 			UniqueFd event;
-			if (socket_io::send_full(peer.get(), &state->record, sizeof(state->record), budget) &&
-			    socket_io::receive_fd(peer.get(), &reply, sizeof(reply), &event, budget) &&
-			    reply.magic == kNotificationMagic && reply.version == 1 && reply.kind == 2 &&
-			    reply.checksum == notification_checksum(reply) && same_binding(state->record, reply) &&
-			    reply.registration_hi == nonce[0] && reply.registration_lo == nonce[1] && is_eventfd(event.get())) {
+			const bool sent = socket_io::send_full(peer.get(), &state->record,
+			                                       sizeof(state->record), budget);
+			const bool received =
+			        sent && socket_io::receive_fd(peer.get(), &reply, sizeof(reply),
+			                                      &event, budget);
+			const bool bound_reply = sent && reply.magic == kNotificationMagic &&
+			                         reply.version == state->record.version &&
+			                         reply.checksum == notification_checksum(reply) &&
+			                         same_binding(state->record, reply) &&
+			                         reply.registration_hi == nonce[0] &&
+			                         reply.registration_lo == nonce[1];
+			if (bound_reply && (reply.kind == 3 || reply.kind == 4))
+				return make_errno_error(ErrorCode::kTransportFailed,
+				                        reply.kind == 3 ? EPROTONOSUPPORT : ENODEV,
+				                        kOperation,
+				                        "producer rejected notification backend");
+			if (received && bound_reply && reply.kind == 2 &&
+			    notification_fd_valid(event.get(), backend)) {
 				state->peer = std::move(peer);
 				state->event = std::move(event);
 				state->epoll.reset(::epoll_create1(EPOLL_CLOEXEC));
@@ -401,12 +428,15 @@ Result<EventNotification> consumer_event_notification_impl(
 	}
 	return make_error(ErrorCode::kTimeout, kOperation, "notification registration deadline exhausted");
 }
-
 }
 
 namespace edge_runtime {
 
 int EventNotification::native_handle() const noexcept { return state_ ? state_->epoll.get() : -1; }
+
+NotificationBackend EventNotification::backend() const noexcept {
+	return state_ ? state_->backend : NotificationBackend::kEventFd;
+}
 
 Result<void> EventNotification::drain() noexcept {
 	using namespace detail;
@@ -415,18 +445,8 @@ Result<void> EventNotification::drain() noexcept {
 	if (!use.acquired) return make_error(ErrorCode::kConcurrentHandleUse, "EventNotification::drain");
 	auto valid = validate_state(*state_);
 	if (!valid) return valid.error();
-	uint64_t counter = 0;
-	bool drained = false;
-	for (int attempt = 0; attempt < 8; ++attempt) {
-		const ssize_t count = ::read(state_->event.get(), &counter, sizeof(counter));
-		if (count == static_cast<ssize_t>(sizeof(counter)) || (count < 0 && errno == EAGAIN)) {
-			drained = true;
-			break;
-		}
-		if (count < 0 && errno == EINTR) continue;
-		return system_error("eventfd drain failed");
-	}
-	if (!drained) { errno = EINTR; return system_error("eventfd drain interrupted repeatedly"); }
+	auto drained = notification_drain(state_->event.get(), state_->backend);
+	if (!drained) return drained.error();
 	struct epoll_event events[2]{};
 	(void)::epoll_wait(state_->epoll.get(), events, 2, 0);
 	for (int attempt = 0; attempt < 8; ++attempt) {

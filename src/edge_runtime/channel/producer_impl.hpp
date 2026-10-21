@@ -82,6 +82,8 @@ void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexc
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 
 Result<void> producer_heartbeat_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
+Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle,
+                                                      NotificationBackend backend);
 
 }  // 命名空间 edge_runtime::detail
 

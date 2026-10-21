@@ -6,10 +6,11 @@
 #include <utility>
 
 #include "edge_runtime/channel/channel_options.hpp"
-#include "edge_runtime/common/error.hpp"
+#include "edge_runtime/channel/event_notification.hpp"
 #include "edge_runtime/channel/loan.hpp"
-#include "edge_runtime/common/result.hpp"
 #include "edge_runtime/channel/sample.hpp"
+#include "edge_runtime/common/error.hpp"
+#include "edge_runtime/common/result.hpp"
 #include "edge_runtime/common/schema.hpp"
 
 namespace edge_runtime::detail {
@@ -26,6 +27,8 @@ void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexc
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 Result<void> producer_heartbeat_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle);
+Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle,
+                                                      NotificationBackend backend);
 Result<void> producer_disable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 int producer_event_notification_error_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 
@@ -83,6 +86,9 @@ class Producer {
 
 	Result<void> enable_event_notifications() {
 		return detail::producer_enable_event_notifications_impl(handle_);
+	}
+	Result<void> enable_event_notifications(NotificationBackend backend) {
+		return detail::producer_enable_event_notifications_impl(handle_, backend);
 	}
 	Result<void> disable_event_notifications() noexcept {
 		return detail::producer_disable_event_notifications_impl(handle_);

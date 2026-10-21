@@ -726,13 +726,24 @@ uint64_t producer_generation_impl(const std::shared_ptr<ProducerHandle>& handle)
 }
 
 Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle) {
+	return producer_enable_event_notifications_impl(handle, NotificationBackend::kEventFd);
+}
+
+Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle,
+                                                      NotificationBackend backend) {
 	if (!handle) return make_error(ErrorCode::kStaleHandle, "Producer::enable_event_notifications");
 	ProducerUseGuard use(&handle->operation_in_use);
 	if (!use) return make_error(ErrorCode::kConcurrentHandleUse, "Producer::enable_event_notifications");
 	auto verified = verify_handle_ownership(*handle, "Producer::enable_event_notifications");
 	if (!verified) return verified.error();
-	if (handle->notification_server) return Result<void>::ok();
-	auto server = NotificationServer::start(*handle);
+	if (handle->notification_server) {
+		if (handle->notification_server->backend() != backend)
+			return make_error(ErrorCode::kInvalidOptions,
+			                  "Producer::enable_event_notifications",
+			                  "disable notifications before switching backend");
+		return Result<void>::ok();
+	}
+	auto server = NotificationServer::start(*handle, backend);
 	if (!server) return server.error();
 	handle->notification_server = std::move(server.value());
 	return Result<void>::ok();

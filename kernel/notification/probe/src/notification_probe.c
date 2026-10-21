@@ -244,6 +244,7 @@ int notification_probe_run(const char* device) {
 	struct sigaction old_action = {0};
 	bool signal_installed = false;
 	int outcome = 1;
+	struct self_ipcs_notification_info info = {0};
 
 	alarm(20);
 	original = open(device, O_RDWR | O_CLOEXEC | O_NONBLOCK);
@@ -258,6 +259,13 @@ int notification_probe_run(const char* device) {
 		               ? 77
 		               : 1;
 	}
+	REQUIRE(ioctl(original, SELF_IPCS_NOTIFICATION_GET_INFO, &info) == 0);
+	REQUIRE(info.abi_version == SELF_IPCS_NOTIFICATION_ABI && info.struct_size == sizeof(info));
+	REQUIRE(info.capabilities ==
+	        (SELF_IPCS_NOTIFICATION_CAP_COUNTER | SELF_IPCS_NOTIFICATION_CAP_STOP));
+	REQUIRE(info.reserved[0] == 0 && info.reserved[1] == 0);
+	REQUIRE(ioctl(original, SELF_IPCS_NOTIFICATION_GET_INFO, (void*)1) == -1 &&
+	        errno == EFAULT);
 	independent = open(device, O_RDWR | O_CLOEXEC | O_NONBLOCK);
 	REQUIRE(independent >= 0);
 	duplicate = fcntl(original, F_DUPFD_CLOEXEC, 0);

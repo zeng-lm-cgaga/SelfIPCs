@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,9 @@
 
 _Static_assert(sizeof(__u64) == SELF_IPCS_NOTIFICATION_COUNTER_BYTES, "counter ABI width");
 _Static_assert(_IOC_SIZE(SELF_IPCS_NOTIFICATION_STOP) == 0, "stop has no payload");
+_Static_assert(sizeof(struct self_ipcs_notification_info) == 32, "info ABI width");
+_Static_assert(offsetof(struct self_ipcs_notification_info, capabilities) == 8, "info ABI offset");
+_Static_assert(_IOC_SIZE(SELF_IPCS_NOTIFICATION_GET_INFO) == 32, "info ioctl ABI width");
 
 int main(int argc, char** argv) {
 	if (argc == 2 && strcmp(argv[1], "--abi-check") == 0) {

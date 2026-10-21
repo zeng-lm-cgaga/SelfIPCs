@@ -5,6 +5,7 @@ add_library(self_ipcs STATIC
   edge_runtime/channel/channel_observer.cpp
   edge_runtime/channel/consumer_impl.cpp
   edge_runtime/channel/event_notification.cpp
+  edge_runtime/channel/notification_backend.cpp
   edge_runtime/channel/control_lock.cpp
   edge_runtime/channel/loan.cpp
   edge_runtime/channel/producer_impl.cpp
@@ -35,7 +36,8 @@ target_include_directories(
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR})
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/kernel/notification/include/uapi)
 
 selfipcs_apply_project_options(self_ipcs)
 target_link_libraries(self_ipcs PUBLIC Threads::Threads PRIVATE rt)

@@ -1,5 +1,3 @@
-#include "notification_demo/api.hpp"
-
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -16,6 +14,8 @@
 #include <cstdlib>
 #include <string>
 #include <utility>
+
+#include "notification_demo/api.hpp"
 
 namespace notification_demo {
 namespace {
@@ -105,7 +105,8 @@ class ChildProcess {
 		if (pid_ <= 0) return;
 		(void)::kill(pid_, SIGKILL);
 		int status = 0;
-		while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+		while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
+		}
 	}
 	ChildProcess(const ChildProcess&) = delete;
 	ChildProcess& operator=(const ChildProcess&) = delete;
@@ -143,8 +144,8 @@ bool send_token(int descriptor, char token) {
 bool await_token(int descriptor, char expected) {
 	const auto deadline = Clock::now() + 3s;
 	while (Clock::now() < deadline) {
-		const auto remaining =
-		        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+		const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+		        deadline - Clock::now());
 		if (remaining.count() < 0) break;
 		pollfd event{descriptor, POLLIN, 0};
 		const int result = ::poll(&event, 1, static_cast<int>(remaining.count()) + 1);
@@ -160,14 +161,14 @@ bool await_token(int descriptor, char expected) {
 	return false;
 }
 
-bool consume(const std::string& name, int status_fd) {
+bool consume(const std::string& name, int status_fd, ipc::NotificationBackend backend) {
 	ipc::ChannelOptions options;
 	options.name = name;
 	auto opened = Consumer::open(options, message_schema());
 	if (!opened) return api_error("independent consumer open", opened.error());
 	Consumer consumer = std::move(opened.value());
-	auto registered = consumer.event_notification(1000ms);
-	if (!registered) return api_error("register sidecar eventfd", registered.error());
+	auto registered = consumer.event_notification(backend, 1000ms);
+	if (!registered) return api_error("register sidecar notification", registered.error());
 	auto notification = std::move(registered.value());
 	FileDescriptor poller(::epoll_create1(EPOLL_CLOEXEC));
 	FileDescriptor timer(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
@@ -180,11 +181,13 @@ bool consume(const std::string& name, int status_fd) {
 	if (::timerfd_settime(timer.get(), 0, &watchdog, nullptr) != 0) {
 		return system_error("arm watchdog timerfd");
 	}
-	EpollWatch notification_del_before_destruction(poller.get(), notification.native_handle(), 1);
+	EpollWatch notification_del_before_destruction(poller.get(), notification.native_handle(),
+	                                               1);
 	EpollWatch timer_watch(poller.get(), timer.get(), 2);
 	EpollWatch stop_watch(poller.get(), stop.get(), 3);
 	if (!notification_del_before_destruction.installed() || !timer_watch.installed() ||
-	    !stop_watch.installed()) return false;
+	    !stop_watch.installed())
+		return false;
 	uint32_t expected = 1;
 	uint64_t previous_sequence = 0;
 	const auto deadline = Clock::now() + 6s;
@@ -203,13 +206,16 @@ bool consume(const std::string& name, int status_fd) {
 			const auto drained = notification.drain();
 			auto sample = consumer.try_read_latest();
 			if (!sample) {
-				if (!drained) return api_error("notification drain (re-register if stale/offline)",
-				                               drained.error());
+				if (!drained)
+					return api_error(
+					        "notification drain (re-register if stale/offline)",
+					        drained.error());
 				if (sample.error().code == ipc::ErrorCode::kNoNewSample) continue;
 				return api_error("read latest after drain", sample.error());
 			}
 			if (sample.value().value.value != expected ||
-			    sample.value().sequence <= previous_sequence) return false;
+			    sample.value().sequence <= previous_sequence)
+				return false;
 			previous_sequence = sample.value().sequence;
 			std::printf("consumer pid=%d value=%u sequence=%llu (%s registration)\n",
 			            static_cast<int>(::getpid()), expected,
@@ -221,19 +227,22 @@ bool consume(const std::string& name, int status_fd) {
 			} else {
 				const uint64_t signal = 1;
 				if (::write(stop.get(), &signal, sizeof(signal)) !=
-				    static_cast<ssize_t>(sizeof(signal))) return system_error("signal stop");
+				    static_cast<ssize_t>(sizeof(signal)))
+					return system_error("signal stop");
 			}
-			if (!drained) return api_error("notification drain after final sample",
-			                               drained.error());
+			if (!drained)
+				return api_error("notification drain after final sample",
+				                 drained.error());
 		}
 	}
 	std::fprintf(stderr, "consumer absolute deadline expired\n");
 	return false;
 }
 
-bool produce() {
+bool produce(ipc::NotificationBackend backend) {
 	std::array<char, 4096> executable{};
-	const ssize_t length = ::readlink("/proc/self/exe", executable.data(), executable.size() - 1);
+	const ssize_t length =
+	        ::readlink("/proc/self/exe", executable.data(), executable.size() - 1);
 	if (length <= 0 || static_cast<size_t>(length) >= executable.size() - 1) {
 		return system_error("read executable path");
 	}
@@ -245,7 +254,7 @@ bool produce() {
 	if (!created) return api_error("create own channel", created.error());
 	Producer producer = std::move(created.value());
 	OwnedChannel own_channel(producer);
-	const auto enabled = producer.enable_event_notifications();
+	const auto enabled = producer.enable_event_notifications(backend);
 	if (!enabled) return api_error("enable notifications", enabled.error());
 	const auto initial = producer.publish(Message{1});
 	if (!initial) return api_error("publish before registration", initial.error());
@@ -254,9 +263,14 @@ bool produce() {
 	FileDescriptor status_read(descriptors[0]);
 	FileDescriptor status_write(descriptors[1]);
 	const std::string status_argument = std::to_string(status_write.get());
-	std::array<char*, 5> arguments{executable.data(), const_cast<char*>("--consumer"),
-	                              const_cast<char*>(name.c_str()),
-	                              const_cast<char*>(status_argument.c_str()), nullptr};
+	const char* backend_name =
+	        backend == ipc::NotificationBackend::kDriver ? "driver" : "eventfd";
+	std::array<char*, 6> arguments{executable.data(),
+	                               const_cast<char*>("--consumer"),
+	                               const_cast<char*>(name.c_str()),
+	                               const_cast<char*>(status_argument.c_str()),
+	                               const_cast<char*>(backend_name),
+	                               nullptr};
 	const pid_t pid = ::fork();
 	if (pid < 0) return system_error("fork");
 	if (pid == 0) {
@@ -273,13 +287,16 @@ bool produce() {
 	if (!await_token(status_read.get(), 'S') || !child.wait()) return false;
 	const int delivery_error = producer.event_notification_error();
 	if (delivery_error != 0) {
-		std::fprintf(stderr, "asynchronous notification delivery errno=%d\n", delivery_error);
+		std::fprintf(stderr, "asynchronous notification delivery errno=%d\n",
+		             delivery_error);
 		return false;
 	}
 	if (!own_channel.close()) return false;
-	std::printf("OK parent=%d child=%d channel=%s; sidecar registration; epoll notification + "
-	            "timerfd + stop eventfd; RAII DEL before notification destruction; own-channel "
-	            "cleanup only\n", static_cast<int>(::getpid()), static_cast<int>(pid), name.c_str());
+	std::printf(
+	        "OK backend=%s parent=%d child=%d channel=%s; sidecar registration; epoll notification + "
+	        "timerfd + stop eventfd; RAII DEL before notification destruction; own-channel "
+	        "cleanup only\n",
+	        backend_name, static_cast<int>(::getpid()), static_cast<int>(pid), name.c_str());
 	return true;
 }
 
@@ -288,18 +305,27 @@ bool produce() {
 
 int main(int argc, char** argv) {
 	(void)::signal(SIGPIPE, SIG_IGN);
-	if (argc == 4 && std::string(argv[1]) == "--consumer") {
+	if (argc == 5 && std::string(argv[1]) == "--consumer") {
 		char* end = nullptr;
 		errno = 0;
 		const long descriptor = std::strtol(argv[3], &end, 10);
 		if (errno != 0 || end == argv[3] || *end != '\0' || descriptor < 0 ||
-		    descriptor > 1'000'000) return 2;
+		    descriptor > 1'000'000)
+			return 2;
 		const notification_demo::FileDescriptor status(static_cast<int>(descriptor));
-		return notification_demo::consume(argv[2], status.get()) ? 0 : 1;
+		const std::string selected = argv[4];
+		if (selected != "eventfd" && selected != "driver") return 2;
+		const auto backend = selected == "driver" ? ipc::NotificationBackend::kDriver
+		                                          : ipc::NotificationBackend::kEventFd;
+		return notification_demo::consume(argv[2], status.get(), backend) ? 0 : 1;
 	}
-	if (argc != 1) {
-		std::fprintf(stderr, "usage: %s\n", argv[0]);
+	ipc::NotificationBackend backend = ipc::NotificationBackend::kEventFd;
+	if (argc == 3 && std::string(argv[1]) == "--backend" &&
+	    (std::string(argv[2]) == "driver" || std::string(argv[2]) == "eventfd")) {
+		if (std::string(argv[2]) == "driver") backend = ipc::NotificationBackend::kDriver;
+	} else if (argc != 1) {
+		std::fprintf(stderr, "usage: %s [--backend eventfd|driver]\n", argv[0]);
 		return 2;
 	}
-	return notification_demo::produce() ? 0 : 1;
+	return notification_demo::produce(backend) ? 0 : 1;
 }

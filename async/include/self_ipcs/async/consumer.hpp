@@ -55,11 +55,19 @@ class Consumer {
 	static Result<Consumer> create(
 	        boost::asio::any_io_executor executor, edge_runtime::Consumer<T>&& consumer,
 	        std::chrono::milliseconds registration_timeout = std::chrono::milliseconds{1000}) {
+		return create(std::move(executor), std::move(consumer),
+		              NotificationBackend::kEventFd, registration_timeout);
+	}
+
+	static Result<Consumer> create(
+	        boost::asio::any_io_executor executor, edge_runtime::Consumer<T>&& consumer,
+	        NotificationBackend backend,
+	        std::chrono::milliseconds registration_timeout = std::chrono::milliseconds{1000}) {
 		if (!executor) {
 			return make_error(ErrorCode::kInvalidOptions, "async::Consumer::create",
 			                  "empty executor");
 		}
-		auto registered = consumer.event_notification(registration_timeout);
+		auto registered = consumer.event_notification(backend, registration_timeout);
 		if (!registered) return registered.error();
 		try {
 			auto source = std::make_shared<Source>(std::move(consumer));

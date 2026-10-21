@@ -133,6 +133,15 @@ static long notification_ioctl(struct file* file, unsigned int command, unsigned
 	struct notification_state* state = file->private_data;
 	int result;
 
+	if (command == SELF_IPCS_NOTIFICATION_GET_INFO) {
+		const struct self_ipcs_notification_info info = {
+		        .abi_version = SELF_IPCS_NOTIFICATION_ABI,
+		        .struct_size = sizeof(struct self_ipcs_notification_info),
+		        .capabilities = SELF_IPCS_NOTIFICATION_CAP_COUNTER |
+		                        SELF_IPCS_NOTIFICATION_CAP_STOP,
+		};
+		return copy_to_user((void __user*)argument, &info, sizeof(info)) ? -EFAULT : 0;
+	}
 	if (command != SELF_IPCS_NOTIFICATION_STOP) return -ENOTTY;
 	if (argument) return -EINVAL;
 	result = notification_lock(file, state);

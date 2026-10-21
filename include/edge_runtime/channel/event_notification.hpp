@@ -8,12 +8,16 @@
 #include "edge_runtime/common/result.hpp"
 
 namespace edge_runtime {
+enum class NotificationBackend : uint32_t { kEventFd = 1, kDriver = 2 };
 class EventNotification;
 namespace detail {
 struct ConsumerHandle;
 struct EventNotificationState;
 Result<EventNotification> consumer_event_notification_impl(
         const std::shared_ptr<ConsumerHandle>& handle, uint64_t timeout_ms);
+Result<EventNotification> consumer_event_notification_impl(
+        const std::shared_ptr<ConsumerHandle>& handle, uint64_t timeout_ms,
+        NotificationBackend backend);
 }
 
 class EventNotification {
@@ -25,6 +29,7 @@ class EventNotification {
 	~EventNotification() = default;
 
 	int native_handle() const noexcept;
+	NotificationBackend backend() const noexcept;
 	Result<void> drain() noexcept;
 
        private:
@@ -32,6 +37,8 @@ class EventNotification {
 	    : state_(std::move(state)) {}
 	friend Result<EventNotification> detail::consumer_event_notification_impl(
 	        const std::shared_ptr<detail::ConsumerHandle>&, uint64_t);
+	friend Result<EventNotification> detail::consumer_event_notification_impl(
+	        const std::shared_ptr<detail::ConsumerHandle>&, uint64_t, NotificationBackend);
 	std::shared_ptr<detail::EventNotificationState> state_;
 };
 }

@@ -140,6 +140,17 @@ class Consumer {
 		return detail::consumer_event_notification_impl(
 		        handle_, static_cast<uint64_t>(timeout.count()));
 	}
+	Result<EventNotification> event_notification(
+	        NotificationBackend backend,
+	        std::chrono::milliseconds timeout = std::chrono::milliseconds{1000}) {
+		if (timeout.count() < 0) {
+			return make_error(ErrorCode::kInvalidOptions,
+			                  "Consumer::event_notification", "negative timeout");
+		}
+		return detail::consumer_event_notification_impl(
+		        handle_, static_cast<uint64_t>(timeout.count()), backend);
+	}
+
 	// 慢路径诊断：重新确认名称与实例绑定关系后读取通道状态。
 	Result<ChannelStatus> status() const noexcept {
 		return detail::consumer_status_impl(handle_);

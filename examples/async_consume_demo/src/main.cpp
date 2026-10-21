@@ -109,7 +109,7 @@ class OwnedProducers {
 	std::vector<ipc::Producer<Message>> producers;
 };
 
-bool produce(const std::string& prefix, int descriptor) {
+bool produce(const std::string& prefix, int descriptor, ipc::NotificationBackend backend) {
 	OwnedProducers owned;
 	for (int index = 0; index < 2; ++index) {
 		ipc::ChannelOptions options;
@@ -117,7 +117,7 @@ bool produce(const std::string& prefix, int descriptor) {
 		auto created = ipc::Producer<Message>::create(options, message_schema());
 		if (!created) return api_error("producer create", created.error());
 		owned.producers.push_back(std::move(created.value()));
-		auto enabled = owned.producers.back().enable_event_notifications();
+		auto enabled = owned.producers.back().enable_event_notifications(backend);
 		if (!enabled) return api_error("enable notifications", enabled.error());
 	}
 	if (!transfer_token(descriptor, 'R', true) || !transfer_token(descriptor, 'G', false)) {
@@ -178,7 +178,7 @@ boost::asio::awaitable<void> consume(std::shared_ptr<AsyncConsumer> consumer, in
 	            index, static_cast<unsigned long long>(last_sequence), last_value);
 }
 
-bool run() {
+bool run(ipc::NotificationBackend backend) {
 	std::array<char, 4096> executable{};
 	const ssize_t size = ::readlink("/proc/self/exe", executable.data(), executable.size() - 1);
 	if (size <= 0 || static_cast<size_t>(size) >= executable.size() - 1) return false;
@@ -197,7 +197,9 @@ bool run() {
 		(void)::close(parent_socket.get());
 		if (::fcntl(child_socket.get(), F_SETFD, 0) != 0) ::_exit(126);
 		::execl(executable.data(), executable.data(), "--producer", prefix.c_str(),
-		        descriptor_argument.c_str(), static_cast<char*>(nullptr));
+		        descriptor_argument.c_str(),
+		        backend == ipc::NotificationBackend::kDriver ? "driver" : "eventfd",
+		        static_cast<char*>(nullptr));
 		::_exit(127);
 	}
 	Child child(pid);
@@ -211,7 +213,8 @@ bool run() {
 		options.name = prefix + "_" + std::to_string(index);
 		auto opened = ipc::Consumer<Message>::open(options, message_schema());
 		if (!opened) return api_error("consumer open", opened.error());
-		auto adapted = AsyncConsumer::create(loop.get_executor(), std::move(opened.value()));
+		auto adapted = AsyncConsumer::create(loop.get_executor(), std::move(opened.value()),
+		                                     backend);
 		if (!adapted) return api_error("async consumer create", adapted.error());
 		first_reads.push_back(adapted.value().async_wait_latest(Clock::now() + 2s));
 		consumers.push_back(std::make_shared<AsyncConsumer>(std::move(adapted.value())));
@@ -253,26 +256,41 @@ bool run() {
 	}
 	const bool acknowledged = transfer_token(parent_socket.get(), 'Q', true);
 	const bool child_ok = child.wait();
-	std::printf("async demo parent=%d producer=%d channels=2 io_threads=1 completed=%d\n",
-	            static_cast<int>(::getpid()), static_cast<int>(pid), completed);
+	std::printf(
+	        "async demo backend=%s parent=%d producer=%d channels=2 io_threads=1 "
+	        "completed=%d\n",
+	        backend == ipc::NotificationBackend::kDriver ? "driver" : "eventfd",
+	        static_cast<int>(::getpid()), static_cast<int>(pid), completed);
 	return success && completed == 2 && acknowledged && child_ok;
 }
-
 }
 
 int main(int argc, char** argv) {
 	(void)::signal(SIGPIPE, SIG_IGN);
-	if (argc == 4 && std::string(argv[1]) == "--producer") {
+	auto backend = ipc::NotificationBackend::kEventFd;
+	if (argc == 3 && std::string(argv[1]) == "--backend") {
+		if (std::string(argv[2]) == "driver")
+			backend = ipc::NotificationBackend::kDriver;
+		else if (std::string(argv[2]) != "eventfd")
+			return 2;
+	}
+	if ((argc == 4 || argc == 5) && std::string(argv[1]) == "--producer") {
+		if (argc == 5) {
+			if (std::string(argv[4]) == "driver")
+				backend = ipc::NotificationBackend::kDriver;
+			else if (std::string(argv[4]) != "eventfd")
+				return 2;
+		}
 		char* end = nullptr;
 		errno = 0;
 		const long descriptor = std::strtol(argv[3], &end, 10);
 		if (errno || end == argv[3] || *end || descriptor < 0 || descriptor > 1'000'000) return 2;
 		const async_consume_demo::Descriptor owned(static_cast<int>(descriptor));
-		return async_consume_demo::produce(argv[2], owned.get()) ? 0 : 1;
+		return async_consume_demo::produce(argv[2], owned.get(), backend) ? 0 : 1;
 	}
-	if (argc != 1) {
-		std::fprintf(stderr, "usage: %s\n", argv[0]);
+	if (argc != 1 && !(argc == 3 && std::string(argv[1]) == "--backend")) {
+		std::fprintf(stderr, "usage: %s [--backend eventfd|driver]\n", argv[0]);
 		return 2;
 	}
-	return async_consume_demo::run() ? 0 : 1;
+	return async_consume_demo::run(backend) ? 0 : 1;
 }

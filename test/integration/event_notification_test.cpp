@@ -1,6 +1,5 @@
-#include <gtest/gtest.h>
-
 #include <fcntl.h>
+#include <gtest/gtest.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -12,10 +11,11 @@
 #include <optional>
 #include <string>
 
-#include "edge_runtime/channel/consumer.hpp"
-#include "edge_runtime/channel/producer.hpp"
 #include "edge_runtime/channel/channel_abi.hpp"
+#include "edge_runtime/channel/consumer.hpp"
+#include "edge_runtime/channel/notification_backend.hpp"
 #include "edge_runtime/channel/notification_service.hpp"
+#include "edge_runtime/channel/producer.hpp"
 #include "edge_runtime/sync/clock.hpp"
 #include "edge_runtime/transport/fd_broker.hpp"
 #include "edge_runtime/transport/shm_object.hpp"
@@ -33,7 +33,8 @@ using edge_runtime::detail::UniqueFd;
 class Peer {
        public:
 	~Peer() { kill_and_wait(); }
-	bool start(const char* role, const edge_runtime::ChannelOptions& options) {
+	bool start(const char* role, const edge_runtime::ChannelOptions& options,
+	           edge_runtime::NotificationBackend backend) {
 		int sockets[2]{};
 		if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) != 0) return false;
 		UniqueFd parent(sockets[0]);
@@ -46,7 +47,10 @@ class Peer {
 			if (::dup2(child.get(), STDIN_FILENO) < 0 || ::dup2(child.get(), STDOUT_FILENO) < 0) _exit(126);
 			(void)::close(parent.get());
 			(void)::close(child.get());
-			::execl(NOTIFICATION_PEER, NOTIFICATION_PEER, role, options.name.c_str(), transport,
+			::execl(NOTIFICATION_PEER, NOTIFICATION_PEER, role, options.name.c_str(),
+			        transport,
+			        backend == edge_runtime::NotificationBackend::kDriver ? "driver"
+			                                                              : "eventfd",
 			        static_cast<char*>(nullptr));
 			_exit(127);
 		}
@@ -98,15 +102,32 @@ int ready(int fd) {
 	return ::poll(&descriptor, 1, 1000);
 }
 
-class NotificationCrossExec : public ::testing::TestWithParam<edge_runtime::Transport> {
+struct NotificationCase {
+	edge_runtime::Transport transport;
+	edge_runtime::NotificationBackend backend;
+};
+
+class NotificationCrossExec : public ::testing::TestWithParam<NotificationCase> {
        protected:
 	edge_runtime::ChannelOptions options;
 	std::optional<Producer> owner;
+	edge_runtime::NotificationBackend backend() const { return GetParam().backend; }
 	void SetUp() override {
+		if (backend() == edge_runtime::NotificationBackend::kDriver) {
+			auto checked = edge_runtime::detail::notification_open(backend());
+			if (!checked && (checked.error().errno_value == ENOENT ||
+			                 checked.error().errno_value == ENODEV ||
+			                 checked.error().errno_value == EACCES ||
+			                 checked.error().errno_value == EPERM))
+				GTEST_SKIP() << "driver runtime unavailable errno="
+				             << checked.error().errno_value;
+			ASSERT_TRUE(checked) << checked.error().context;
+		}
 		options.name = edge_test::unique_channel_name("notify_exec");
-		options.transport = GetParam();
+		options.transport = GetParam().transport;
 	}
 	void TearDown() override {
+		if (options.name.empty()) return;
 		if (!owner) {
 			auto recovered = Producer::create(options, TestPayloadV1Schema());
 			if (recovered) owner.emplace(std::move(recovered.value()));
@@ -117,18 +138,18 @@ class NotificationCrossExec : public ::testing::TestWithParam<edge_runtime::Tran
 		auto producer = Producer::create(options, TestPayloadV1Schema());
 		ASSERT_TRUE(producer);
 		owner.emplace(std::move(producer.value()));
-		ASSERT_TRUE(owner->enable_event_notifications());
+		ASSERT_TRUE(owner->enable_event_notifications(backend()));
 		ASSERT_TRUE(owner->publish(TestPayloadV1{0x5A000001u, 1, 0}));
 	}
 };
 
 TEST_P(NotificationCrossExec, IndependentProducerAndCleanExit) {
 	Peer peer;
-	ASSERT_TRUE(peer.start("producer", options));
+	ASSERT_TRUE(peer.start("producer", options, backend()));
 	ASSERT_TRUE(peer.expect("READY\n"));
 	auto consumer = Consumer::open(options, TestPayloadV1Schema());
 	ASSERT_TRUE(consumer);
-	auto notification = consumer.value().event_notification();
+	auto notification = consumer.value().event_notification(backend());
 	ASSERT_TRUE(notification);
 	ASSERT_TRUE(notification.value().drain());
 	auto initial = consumer.value().try_read_latest();
@@ -152,11 +173,11 @@ TEST_P(NotificationCrossExec, IndependentProducerAndCleanExit) {
 
 TEST_P(NotificationCrossExec, KilledProducerAndNewInstanceRejectOldFd) {
 	Peer peer;
-	ASSERT_TRUE(peer.start("producer", options));
+	ASSERT_TRUE(peer.start("producer", options, backend()));
 	ASSERT_TRUE(peer.expect("READY\n"));
 	auto consumer = Consumer::open(options, TestPayloadV1Schema());
 	ASSERT_TRUE(consumer);
-	auto old = consumer.value().event_notification();
+	auto old = consumer.value().event_notification(backend());
 	ASSERT_TRUE(old);
 	ASSERT_TRUE(old.value().drain());
 	peer.kill_and_wait();
@@ -168,7 +189,7 @@ TEST_P(NotificationCrossExec, KilledProducerAndNewInstanceRejectOldFd) {
 	EXPECT_FALSE(old.value().drain());
 	ASSERT_TRUE(consumer.value().reconnect());
 	EXPECT_FALSE(old.value().drain());
-	auto current = consumer.value().event_notification();
+	auto current = consumer.value().event_notification(backend());
 	ASSERT_TRUE(current);
 	EXPECT_TRUE(current.value().drain());
 	auto sample = consumer.value().try_read_latest();
@@ -179,12 +200,12 @@ TEST_P(NotificationCrossExec, KilledProducerAndNewInstanceRejectOldFd) {
 TEST_P(NotificationCrossExec, KilledConsumerAndNewRoleRegisters) {
 	create();
 	Peer peer;
-	ASSERT_TRUE(peer.start("consumer", options));
+	ASSERT_TRUE(peer.start("consumer", options, backend()));
 	ASSERT_TRUE(peer.expect("READY\n"));
 	peer.kill_and_wait();
 	auto consumer = Consumer::open(options, TestPayloadV1Schema());
 	ASSERT_TRUE(consumer);
-	auto notification = consumer.value().event_notification();
+	auto notification = consumer.value().event_notification(backend());
 	ASSERT_TRUE(notification);
 	ASSERT_TRUE(notification.value().drain());
 	ASSERT_TRUE(owner->publish(TestPayloadV1{0x5A000001u, 2, 0}));
@@ -199,7 +220,7 @@ TEST_P(NotificationCrossExec, SameUidDifferentProcessCannotStealConsumerNotifica
 	using namespace edge_runtime::detail;
 	create();
 	Peer peer;
-	ASSERT_TRUE(peer.start("consumer", options));
+	ASSERT_TRUE(peer.start("consumer", options, backend()));
 	ASSERT_TRUE(peer.expect("READY\n"));
 	auto descriptor = options.transport == edge_runtime::Transport::kPosixShm
 	        ? shm_open_existing(channel_shm_name(options.name))
@@ -223,7 +244,8 @@ TEST_P(NotificationCrossExec, SameUidDifferentProcessCannotStealConsumerNotifica
 	};
 	NotificationRecord request{};
 	request.magic = kNotificationMagic;
-	request.version = request.kind = 1;
+	request.version = static_cast<uint32_t>(backend());
+	request.kind = 1;
 	request.generation = header->generation;
 	request.nonce_hi = header->instance_nonce_hi;
 	request.nonce_lo = header->instance_nonce_lo;
@@ -244,12 +266,26 @@ TEST_P(NotificationCrossExec, SameUidDifferentProcessCannotStealConsumerNotifica
 	ASSERT_TRUE(peer.wait());
 	auto consumer = Consumer::open(options, TestPayloadV1Schema());
 	ASSERT_TRUE(consumer);
-	auto registered = consumer.value().event_notification();
+	auto registered = consumer.value().event_notification(backend());
 	ASSERT_TRUE(registered);
 	EXPECT_TRUE(registered.value().drain());
 }
 
-INSTANTIATE_TEST_SUITE_P(Transports, NotificationCrossExec,
-                        ::testing::Values(edge_runtime::Transport::kPosixShm,
-                                          edge_runtime::Transport::kMemfdFdPass));
+INSTANTIATE_TEST_SUITE_P(
+        Transports, NotificationCrossExec,
+        ::testing::Values(NotificationCase{edge_runtime::Transport::kPosixShm,
+                                           edge_runtime::NotificationBackend::kEventFd},
+                          NotificationCase{edge_runtime::Transport::kMemfdFdPass,
+                                           edge_runtime::NotificationBackend::kEventFd},
+                          NotificationCase{edge_runtime::Transport::kPosixShm,
+                                           edge_runtime::NotificationBackend::kDriver},
+                          NotificationCase{edge_runtime::Transport::kMemfdFdPass,
+                                           edge_runtime::NotificationBackend::kDriver}),
+        [](const ::testing::TestParamInfo<NotificationCase>& case_info) {
+	        return std::string(case_info.param.backend == edge_runtime::NotificationBackend::kDriver
+	                                   ? "Driver"
+	                                   : "Eventfd") +
+	               (case_info.param.transport == edge_runtime::Transport::kPosixShm ? "Shm"
+	                                                                           : "Memfd");
+        });
 }

@@ -43,10 +43,13 @@ Result<void> eventfd_signal(int fd) noexcept;
 class NotificationServer {
        public:
 	static Result<std::shared_ptr<NotificationServer>> start(ProducerHandle& handle);
+	static Result<std::shared_ptr<NotificationServer>> start(ProducerHandle& handle,
+	                                                         NotificationBackend backend);
 	~NotificationServer();
 	void stop() noexcept;
 	void notify() noexcept;
 	int last_error() const noexcept { return last_error_.load(std::memory_order_relaxed); }
+	NotificationBackend backend() const noexcept { return backend_; }
 
        private:
 	NotificationServer() = default;
@@ -57,6 +60,7 @@ class NotificationServer {
 	ChannelHeaderAbi* header_{};
 	BootstrapHeaderAbi* bootstrap_{};
 	NotificationRecord owner_{};
+	NotificationBackend backend_{NotificationBackend::kEventFd};
 	std::string path_;
 	uint64_t socket_dev_{};
 	uint64_t socket_ino_{};

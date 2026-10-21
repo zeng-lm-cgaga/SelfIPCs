@@ -1,13 +1,12 @@
-#include <gtest/gtest.h>
-
-#include <fcntl.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <gtest/gtest.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <signal.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -20,10 +19,11 @@
 #include <optional>
 
 #include "edge_runtime/channel/consumer.hpp"
+#include "edge_runtime/channel/notification_backend.hpp"
 #include "edge_runtime/channel/notification_service.hpp"
 #include "edge_runtime/channel/producer.hpp"
-#include "edge_runtime/sync/shared_atomic.hpp"
 #include "edge_runtime/sync/clock.hpp"
+#include "edge_runtime/sync/shared_atomic.hpp"
 #include "edge_runtime/transport/socket_io.hpp"
 #include "test_payload.hpp"
 #include "test_util.hpp"
@@ -272,6 +272,98 @@ TEST_F(EventNotificationTest, DefaultFutexAndBoundedRegistrationOptions) {
 	EXPECT_LT(std::chrono::steady_clock::now() - started, 500ms);
 	EXPECT_FALSE(consumer->event_notification(-1ms));
 	EXPECT_FALSE(consumer->event_notification(std::chrono::milliseconds::max()));
+}
+
+TEST_F(EventNotificationTest, UnknownBackendDoesNotChangeDefaultChannel) {
+	const auto unknown = static_cast<edge_runtime::NotificationBackend>(99);
+	auto enabled = producer->enable_event_notifications(unknown);
+	ASSERT_FALSE(enabled);
+	EXPECT_EQ(enabled.error().code, ErrorCode::kInvalidOptions);
+	auto registered = consumer->event_notification(unknown, 50ms);
+	ASSERT_FALSE(registered);
+	EXPECT_EQ(registered.error().code, ErrorCode::kInvalidOptions);
+	publish(1);
+	EXPECT_TRUE(consumer->wait_latest(50ms));
+}
+
+TEST_F(EventNotificationTest, BackendMismatchIsExplicitAndEventfdStillRegisters) {
+	enable();
+	const auto started = std::chrono::steady_clock::now();
+	auto mismatch =
+	        consumer->event_notification(edge_runtime::NotificationBackend::kDriver, 500ms);
+	ASSERT_FALSE(mismatch);
+	EXPECT_EQ(mismatch.error().code, ErrorCode::kTransportFailed);
+	EXPECT_EQ(mismatch.error().errno_value, EPROTONOSUPPORT);
+	EXPECT_LT(std::chrono::steady_clock::now() - started, 500ms);
+	auto registered = consumer->event_notification();
+	ASSERT_TRUE(registered);
+	EXPECT_EQ(registered.value().backend(), edge_runtime::NotificationBackend::kEventFd);
+	EXPECT_TRUE(registered.value().drain());
+	publish(1);
+	EXPECT_EQ(ready(registered.value().native_handle(), 500), 1);
+	EXPECT_TRUE(registered.value().drain());
+	EXPECT_TRUE(consumer->try_read_latest());
+	EXPECT_FALSE(
+	        producer->enable_event_notifications(edge_runtime::NotificationBackend::kDriver));
+}
+
+TEST_F(EventNotificationTest, MissingDriverPreservesErrnoWithoutFallback) {
+	struct stat device {};
+	if (::lstat("/dev/self_ipcs_notification", &device) == 0)
+		GTEST_SKIP() << "device present: real driver integration is a separate check";
+	const int observed_errno = errno;
+	const int before = descriptor_count();
+	auto enabled =
+	        producer->enable_event_notifications(edge_runtime::NotificationBackend::kDriver);
+	ASSERT_FALSE(enabled);
+	EXPECT_EQ(enabled.error().code, ErrorCode::kTransportFailed);
+	EXPECT_EQ(enabled.error().errno_value, observed_errno);
+	EXPECT_EQ(descriptor_count(), before);
+	publish(1);
+	EXPECT_TRUE(consumer->wait_latest(50ms));
+	EXPECT_TRUE(producer->enable_event_notifications());
+	EXPECT_TRUE(consumer->event_notification());
+}
+
+TEST_F(EventNotificationTest, DescriptorBackendAndFlagsAreStrict) {
+	using edge_runtime::NotificationBackend;
+	using edge_runtime::detail::notification_fd_valid;
+	edge_runtime::detail::UniqueFd descriptor(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+	ASSERT_GE(descriptor.get(), 0);
+	EXPECT_TRUE(notification_fd_valid(descriptor.get(), NotificationBackend::kEventFd));
+	EXPECT_FALSE(notification_fd_valid(descriptor.get(), NotificationBackend::kDriver));
+	ASSERT_EQ(::fcntl(descriptor.get(), F_SETFD, 0), 0);
+	EXPECT_FALSE(notification_fd_valid(descriptor.get(), NotificationBackend::kEventFd));
+	ASSERT_EQ(::fcntl(descriptor.get(), F_SETFD, FD_CLOEXEC), 0);
+	ASSERT_EQ(::fcntl(descriptor.get(), F_SETFL, 0), 0);
+	EXPECT_FALSE(notification_fd_valid(descriptor.get(), NotificationBackend::kEventFd));
+	edge_runtime::detail::UniqueFd wrong(::open("/dev/null", O_RDWR | O_NONBLOCK | O_CLOEXEC));
+	ASSERT_GE(wrong.get(), 0);
+	EXPECT_FALSE(notification_fd_valid(wrong.get(), NotificationBackend::kDriver));
+	EXPECT_FALSE(notification_fd_valid(wrong.get(), NotificationBackend::kEventFd));
+}
+
+TEST_F(EventNotificationTest, DriverSignalSyscallErrorsAreDistinctFromEventfdSaturation) {
+	using edge_runtime::NotificationBackend;
+	using edge_runtime::detail::notification_signal;
+	edge_runtime::detail::UniqueFd descriptor(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+	ASSERT_GE(descriptor.get(), 0);
+	write_error = EAGAIN;
+	EXPECT_TRUE(notification_signal(descriptor.get(), NotificationBackend::kEventFd));
+	auto busy = notification_signal(descriptor.get(), NotificationBackend::kDriver);
+	ASSERT_FALSE(busy);
+	EXPECT_EQ(busy.error().errno_value, EAGAIN);
+	write_error = EOVERFLOW;
+	auto overflow = notification_signal(descriptor.get(), NotificationBackend::kDriver);
+	ASSERT_FALSE(overflow);
+	EXPECT_EQ(overflow.error().errno_value, EOVERFLOW);
+	write_error = 0;
+	write_interrupts = 7;
+	EXPECT_TRUE(notification_signal(descriptor.get(), NotificationBackend::kDriver));
+	write_interrupts = 8;
+	auto interrupted = notification_signal(descriptor.get(), NotificationBackend::kDriver);
+	ASSERT_FALSE(interrupted);
+	EXPECT_EQ(interrupted.error().errno_value, EINTR);
 }
 
 TEST_F(EventNotificationTest, PublishBeforeRegistrationMoveAndCloexec) {

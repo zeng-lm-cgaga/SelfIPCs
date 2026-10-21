@@ -110,6 +110,9 @@ install(
   FILE SelfIPCsTargets.cmake
   NAMESPACE SelfIPCs::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SelfIPCs)
+install(FILES kernel/notification/include/uapi/self_ipcs_notification.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/self_ipcs/notification
+  RENAME driver_uapi.h)
 
 configure_package_config_file(
   cmake/SelfIPCsConfig.cmake.in

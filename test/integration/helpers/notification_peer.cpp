@@ -34,13 +34,15 @@ char command() {
 	return 0;
 }
 
-int produce(const edge_runtime::ChannelOptions& options) {
+int produce(const edge_runtime::ChannelOptions& options,
+            edge_runtime::NotificationBackend backend) {
 	{
 		auto created = self_ipcs::Producer<TestPayloadV1>::create(options, TestPayloadV1Schema());
 		if (!created) return 2;
 		auto& producer = created.value();
-		if (!producer.enable_event_notifications() ||
-		    !producer.publish(TestPayloadV1{0x5A000001u, 1, 0}) || !report("READY\n")) return 3;
+		if (!producer.enable_event_notifications(backend) ||
+		    !producer.publish(TestPayloadV1{0x5A000001u, 1, 0}) || !report("READY\n"))
+			return 3;
 		const char next = command();
 		if (next == 'p') {
 			if (!producer.publish(TestPayloadV1{0x5A000001u, 2, 0}) || !report("PUBLISHED\n")) return 4;
@@ -51,11 +53,12 @@ int produce(const edge_runtime::ChannelOptions& options) {
 	return report("CLEAN\n") ? 0 : 8;
 }
 
-int consume(const edge_runtime::ChannelOptions& options) {
+int consume(const edge_runtime::ChannelOptions& options,
+            edge_runtime::NotificationBackend backend) {
 	{
 		auto consumer = self_ipcs::Consumer<TestPayloadV1>::open(options, TestPayloadV1Schema());
 		if (!consumer) return 10;
-		auto notification = consumer.value().event_notification(1000ms);
+		auto notification = consumer.value().event_notification(backend, 1000ms);
 		if (!notification || !notification.value().drain() ||
 		    !consumer.value().try_read_latest() || !report("READY\n")) return 11;
 		if (command() != 'q') return 12;
@@ -65,9 +68,17 @@ int consume(const edge_runtime::ChannelOptions& options) {
 }
 
 int main(int argc, char** argv) {
-	if (argc != 4) return 1;
+	if (argc != 4 && argc != 5) return 1;
+	auto backend = edge_runtime::NotificationBackend::kEventFd;
+	if (argc == 5) {
+		if (std::string(argv[4]) == "driver")
+			backend = edge_runtime::NotificationBackend::kDriver;
+		else if (std::string(argv[4]) != "eventfd")
+			return 1;
+	}
 	edge_runtime::ChannelOptions options;
 	options.name = argv[2];
 	if (std::string(argv[3]) == "memfd") options.transport = edge_runtime::Transport::kMemfdFdPass;
-	return std::string(argv[1]) == "producer" ? produce(options) : consume(options);
+	return std::string(argv[1]) == "producer" ? produce(options, backend)
+	                                          : consume(options, backend);
 }
