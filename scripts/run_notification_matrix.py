@@ -3,6 +3,7 @@
 
 Formal: 64B/1P1C, 100/1000Hz, same/different CPUs, three alternating
 futex/eventfd pairs (24 runs), 1000 publications, first 100 observations warm.
+Explicit --backends futex,eventfd,driver selects the 36-run three-backend matrix.
 Never deletes resource paths. Worker windows include pacing, payload/checksum,
 buffered CSV recording and the producer eventfd service thread (RUSAGE_SELF).
 Registration, initial thread enumeration and teardown are outside those windows.
@@ -38,12 +39,21 @@ RULES = {
 }
 
 
-def cases(smoke: bool = False) -> list[dict]:
+def parse_backends(value: str) -> tuple[str, ...]:
+    requested = value.split(",")
+    supported = ("futex", "eventfd", "driver")
+    if not requested or len(requested) != len(set(requested)) or any(
+            item not in supported for item in requested):
+        raise argparse.ArgumentTypeError("backends must be unique names from futex,eventfd,driver")
+    return tuple(item for item in supported if item in requested)
+
+
+def cases(smoke: bool = False, backends: tuple[str, ...] = ("futex", "eventfd")) -> list[dict]:
     planned = []
     for repeat in range(1, 2 if smoke else 4):
         for rate in ([100] if smoke else [100, 1000]):
             for placement in (["same"] if smoke else ["same", "different"]):
-                order = ["futex", "eventfd"] if repeat % 2 else ["eventfd", "futex"]
+                order = backends if repeat % 2 else backends[::-1]
                 for notification in order:
                     prefix = "notification-smoke" if smoke else "notification"
                     planned.append({
@@ -123,6 +133,8 @@ def main() -> int:
     parser.add_argument("--cpu-a", type=int, default=0)
     parser.add_argument("--cpu-b", type=int, default=1)
     parser.add_argument("--smoke", action="store_true", help="two 50-publication checks only")
+    parser.add_argument("--backends", type=parse_backends, default=("futex", "eventfd"),
+                        help="comma-separated subset of futex,eventfd,driver; missing driver fails its runs")
     args = parser.parse_args()
 
     def interrupted_by_signal(signum, frame):
@@ -150,12 +162,12 @@ def main() -> int:
                 parser.error(f"formal collection requires {setting}")
     root = output_root / f"notification-{'smoke' if args.smoke else 'formal'}-{time.time_ns()}-{os.getpid()}"
     root.mkdir()
-    planned = cases(args.smoke)
+    planned = cases(args.smoke, args.backends)
     rules = dict(RULES)
     if args.smoke:
         rules.update(accepted_publications=50, warmup_observations=5,
                      minimum_postwarm_observations=45)
-    save(root / "plan.json", {"schema": 1, "smoke": args.smoke, "cases": planned,
+    save(root / "plan.json", {"schema": 2, "backends": args.backends, "smoke": args.smoke, "cases": planned,
                              "rules": rules, "cpu_a": args.cpu_a, "cpu_b": args.cpu_b,
                              "serial": True, "watchdog_s": 60}, immutable=True)
     save(root / "plan.sha256.json", {"sha256": digest(root / "plan.json")}, immutable=True)

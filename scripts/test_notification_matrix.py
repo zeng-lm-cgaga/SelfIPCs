@@ -32,8 +32,9 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value) + "\n")
 
 
-def fixture(directory: Path, *, jump: bool = False, initial_jump: bool = False) -> dict:
-    case = verifier.normative_cases(True)[0]
+def fixture(directory: Path, *, jump: bool = False, initial_jump: bool = False,
+            backend: str = "futex", backend_identity: bool = False) -> dict:
+    case = verifier.normative_cases(True, (backend,))[0]
     all_sequences = list(range(1, 51))
     sequences = [value for value in all_sequences if not (jump and value == 10)
                  and not (initial_jump and value == 1)]
@@ -59,7 +60,7 @@ def fixture(directory: Path, *, jump: bool = False, initial_jump: bool = False) 
     missed = sum(row[6] for row in rows)
     for role, pid in (("producer", 100), ("consumer", 200)):
         argv[role] = ["taskset", "-c", "0", f"/fixture/{role}", "--name", "fixture",
-                      "--payload", "64", "--notification", "futex", "--rate", "100",
+                      "--payload", "64", "--notification", backend, "--rate", "100",
                       "--max-time-ms", "2000", "--checksum", "1", "--ready-fd", "3"]
         argv[role] += ["--samples", "50"] if role == "producer" else [
             "--max-samples", "50", "--final-sequence", "50", "--mode", "futex"]
@@ -70,7 +71,7 @@ def fixture(directory: Path, *, jump: bool = False, initial_jump: bool = False) 
                      swaps=0, messages_sent=0, messages_received=0)
         end = dict(begin, monotonic_raw_ns=1_500_000_000, realtime_ns=1_700_000_001_500_000_000,
                    user_us=200, system_us=200, voluntary_csw=51)
-        metrics = dict(version=1, role=role, pid=pid, notification="futex", payload_bytes=64,
+        metrics = dict(version=1, role=role, pid=pid, notification=backend, payload_bytes=64,
                        target=50, rate_hz=100, clock="CLOCK_MONOTONIC_RAW", rusage_scope="RUSAGE_SELF",
                        valid=True, begin_ns=begin["monotonic_raw_ns"], end_ns=end["monotonic_raw_ns"],
                        begin_realtime_ns=begin["realtime_ns"], end_realtime_ns=end["realtime_ns"],
@@ -84,6 +85,10 @@ def fixture(directory: Path, *, jump: bool = False, initial_jump: bool = False) 
                        process_allowed_cpus_begin=[0], process_allowed_cpus_end=[0],
                        threads_begin=[dict(tid=pid, cpus=[0])], threads_end=[dict(tid=pid, cpus=[0])])
         metrics.update({key: 0 for key in verifier.EXTRA_USAGE})
+        if role == "producer" and backend in ("eventfd", "driver"):
+            for phase in ("begin", "end"):
+                metrics[f"thread_count_{phase}"] = 2
+                metrics[f"threads_{phase}"] = [dict(tid=pid, cpus=[0]), dict(tid=pid + 1, cpus=[0])]
         metrics["process_maxrss_kb_at_end"] = 100
         lifecycle = dict(scope="wait4_process_lifecycle", exit_code=0, signal=0, timed_out=False,
                          exec_ok=True, wall_us=600000, user_us=300, system_us=300,
@@ -91,6 +96,8 @@ def fixture(directory: Path, *, jump: bool = False, initial_jump: bool = False) 
                          maxrss_kb=100, input_blocks=0, output_blocks=0, signals=0,
                          swaps=0, messages_sent=0, messages_received=0)
         raw = "WORK_BEGIN " + json.dumps(begin) + "\nWORK_END " + json.dumps(end)
+        if backend_identity:
+            raw += f"\nNOTIFICATION_BACKEND requested={backend} actual={backend}"
         raw += "\nWORK_METRICS " + json.dumps(metrics) + "\n"
         raw += "DONE published=50 cpu_us=200\n" if role == "producer" else (
             f"SUMMARY reads={len(rows)} torn=0 missed_total={missed} last_seq=50 "
@@ -100,7 +107,7 @@ def fixture(directory: Path, *, jump: bool = False, initial_jump: bool = False) 
     write_json(directory / "workers.argv.json", argv)
     write_json(directory / "owned-resources.json", {"channel": "fixture", "paths": []})
     latencies = [row[5] for row in rows[5:]]
-    summary = dict(run_id=case["run_id"], transport="shm", notification="futex", mode="futex",
+    summary = dict(run_id=case["run_id"], transport="shm", notification=backend, mode=backend,
                    payload_bytes=64, placement="same", rate_hz=100, count=len(rows), warmup_count=5,
                    measured_count=len(latencies), missed_samples=missed, torn_reads=0,
                    latency_ns=dict(verifier.quantiles(latencies), min=min(latencies), max=max(latencies),
@@ -133,6 +140,70 @@ class NotificationVerifierTests(unittest.TestCase):
         self.assertEqual(runner.RULES, verifier.RULES)
         self.assertEqual(runner.cases()[8]["notification"], "eventfd")
         self.assertEqual(runner.cases()[16]["notification"], "futex")
+
+    def test_three_backend_plan_and_explicit_subset(self):
+        for smoke in (False, True):
+            for backends in (("futex", "eventfd", "driver"), ("driver",), ("futex", "driver")):
+                self.assertEqual(runner.cases(smoke, backends), verifier.normative_cases(smoke, backends))
+        planned = runner.cases(False, ("futex", "eventfd", "driver"))
+        self.assertEqual(len(planned), 36)
+        self.assertEqual([case["notification"] for case in planned[:3]], ["futex", "eventfd", "driver"])
+        self.assertEqual([case["notification"] for case in planned[12:15]], ["driver", "eventfd", "futex"])
+
+    def test_backend_selectors_reject_empty_unknown_duplicate(self):
+        for value in ("", "eventfd,driver,driver", "driver,unknown", "futex,"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                runner.parse_backends(value)
+            with self.assertRaisesRegex(ValueError, "invalid backend selection"):
+                verifier.normative_backends(value.split(","))
+        self.assertEqual(runner.parse_backends("driver,futex"), ("futex", "driver"))
+
+    def test_driver_plan_cannot_substitute_eventfd(self):
+        planned = verifier.normative_cases(False, ("futex", "eventfd", "driver"))
+        planned[2] = dict(planned[1])
+        write_json(self.root / "plan.json", dict(smoke=False, schema=2,
+                   backends=["futex", "eventfd", "driver"], cases=planned))
+        write_json(self.root / "manifest.json", {})
+        with self.assertRaisesRegex(ValueError, "normative matrix config mismatch"):
+            verifier.verify(self.root)
+
+    def test_explicit_scope_rejects_default_pair_as_three_backend(self):
+        write_json(self.root / "plan.json", dict(smoke=False, schema=1))
+        write_json(self.root / "manifest.json", {})
+        with self.assertRaisesRegex(ValueError, "requested backend scope mismatch"):
+            verifier.verify(self.root, expected_backends=("futex", "eventfd", "driver"))
+
+    def test_driver_requires_actual_backend_identity(self):
+        case = fixture(self.root, backend="driver")
+        with self.assertRaisesRegex(ValueError, "actual backend mismatch or missing"):
+            verifier.verify_run(self.root, case, 0, 1)
+        case = fixture(self.root, backend="driver", backend_identity=True)
+        self.assertTrue(verifier.verify_run(self.root, case, 0, 1)["eligible"])
+        path = self.root / "consumer.raw"
+        path.write_text(path.read_text().replace("actual=driver", "actual=eventfd"))
+        with self.assertRaisesRegex(ValueError, "actual backend mismatch or missing"):
+            verifier.verify_run(self.root, case, 0, 1)
+
+    def test_new_plan_requires_identity_but_legacy_raw_is_supported(self):
+        self.assertTrue(self.verify()["eligible"])
+        with self.assertRaisesRegex(ValueError, "actual backend mismatch or missing"):
+            verifier.verify_run(self.root, self.case, 0, 1, require_backend_identity=True)
+        case = fixture(self.root, backend_identity=True)
+        self.assertTrue(verifier.verify_run(self.root, case, 0, 1, require_backend_identity=True)["eligible"])
+
+    def test_driver_service_thread_missing_rejected(self):
+        case = fixture(self.root, backend="driver", backend_identity=True)
+        path = self.root / "producer.raw"
+        text = path.read_text()
+        metrics = verifier.one_record(text, "WORK_METRICS")
+        changed = copy.deepcopy(metrics)
+        for phase in ("begin", "end"):
+            changed[f"threads_{phase}"] = changed[f"threads_{phase}"][:1]
+            changed[f"thread_count_{phase}"] = 1
+        path.write_text(text.replace("WORK_METRICS " + json.dumps(metrics),
+                                     "WORK_METRICS " + json.dumps(changed)))
+        with self.assertRaisesRegex(ValueError, "service thread unaccounted"):
+            verifier.verify_run(self.root, case, 0, 1)
 
     def test_modified_metrics_rejected(self):
         path = self.root / "producer.raw"

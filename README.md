@@ -11,7 +11,7 @@
 | 固定块缓冲池 | `SharedBufferPool` | 4/16KiB 共享内存缓冲区，通过 `BufferHandle` 跨进程传递 |
 
 SPSC 支持 POSIX shm、memfd + SCM_RIGHTS 和共享槽位的原地读写。
-可选 eventfd 通知将 SPSC 新样本提示接入应用的 epoll，与 timerfd、停止信号或其他 Linux FD 一起等待。
+可选 eventfd / driver 通知将 SPSC 新样本提示接入应用的 epoll，与 timerfd、停止信号或其他 Linux FD 一起等待。
 缓冲池可与 `MpmcQueue<BufferHandle>` 组合：大块数据留在共享内存中，队列传递 88B 句柄。
 
 - **同步与所有权**：进程共享 futex、MPMC 生产/消费分侧 gate、RAII 管理共享缓冲区所有权；校验 schema、实例代次和进程身份。
@@ -90,7 +90,7 @@ ctest --test-dir /tmp/selfipcs-notification-demo --output-on-failure
 # 旧包和头入口：在另一个构建目录增加 -DSELFIPCS_DEMO_USE_LEGACY=ON
 ```
 
-比较工具 `self_ipcs_shm_bench` 及其 producer/consumer 支持 `--notification futex|eventfd`，默认 futex。
+比较工具 `self_ipcs_shm_bench` 及其 producer/consumer 支持 `--notification futex|eventfd|driver`，默认 futex。
 驱动在相同 payload、CPU、节拍、预热和采样目标下替换 SHM 等待方式，保留 Socket 与 poll 对照：
 两种等待方式都通过继承的启动 socket 握手，在消费者完成注册和 CSV 准备后开始发布；每个运行使用独立通道名。
 
@@ -101,7 +101,7 @@ build/selfipcs-release/tools/self_ipcs_shm_bench --smoke --notification eventfd 
 ```
 
 每次采集使用独立输出目录；下面的历史性能表保留 2026-10-13 的 futex 配置与采集版本。
-每轮 SHM（futex/eventfd/poll）或 Socket 的两个 worker 共用一个绝对截止时间：工作预算加 `17s` 启动余量，
+每轮 SHM（futex/eventfd/driver/poll）或 Socket 的两个 worker 共用一个绝对截止时间：工作预算加 `17s` 启动余量，
 覆盖输出排空和进程退出；超时后清理该 worker 进程组并将运行标记为失败。
 
 2026-10-21 Linux 虚拟机上的 eventfd 基础版本 `cd9256f`（工具修正 `58c0551`）验证覆盖
@@ -110,6 +110,33 @@ build/selfipcs-release/tools/self_ipcs_shm_bench --smoke --notification eventfd 
 完成 80 项相关测试（`detect_leaks=0`）；Release 的新旧包与混合入口完成 6 组独立安装消费，
 ASan/UBSan 的新旧通知示例完成 2 组。比较入口以相同条件的 50 样本 smoke 校验启动握手、
 序号及分位数，eventfd 的正式性能采集单独进行。
+
+### 可选驱动通知后端
+
+驱动后端沿用同一共享内存数据面与通知对象：
+
+```cpp
+producer.enable_event_notifications(self_ipcs::NotificationBackend::kDriver);
+auto notification = consumer.event_notification(self_ipcs::NotificationBackend::kDriver);
+```
+
+两端显式选择同一后端；原无参接口继续选择 eventfd。启用 driver 时打开
+`/dev/self_ipcs_notification`，设备缺失或权限不足返回 `TransportFailed` 和对应 errno。
+切换后端先禁用原服务，再启用新服务。`EventNotification::backend()` 返回注册使用的后端。
+
+- sidecar v1 对应 eventfd，v2 对应 driver；保持原记录尺寸、身份与实例校验。新端收到后端不匹配的
+  明确拒绝时返回 `TransportFailed/EPROTONOSUPPORT`，旧端沿原注册截止时间结束交换。
+- 每次注册创建一个驱动 open-file-description，通过 SCM_RIGHTS 把同一个对象传给 consumer。
+  接收端核验字符设备、设备号、读写/非阻塞/CLOEXEC 标志及 `GET_INFO` 的 ABI/能力。
+- driver 的操作锁暂忙 `EAGAIN` 至多重试 8 次；计数溢出 `EOVERFLOW` 单独报告。
+  发布提交始终保留成功结果，通知失败记录 errno 并关闭控制连接唤醒接收端。
+  driver drain 遇到 `EAGAIN` 可以是暂忙，应用继续检查最新共享样本并保留 level-triggered 监听。
+- SDK 析构、局部取消和禁用服务按引用/控制连接收尾；原始 UAPI `STOP` 是共享通知对象的持久停止。
+  SDK 保留该全局操作给显式使用 UAPI 的调用方。应用始终先 DEL 外层 epoll 注册，再释放通知对象。
+
+安装后的 `notification_demo --backend driver` 及 `async_consume_demo --backend driver`
+提供真实 fork/exec、独立打开通道和生命周期演示；默认参数使用 eventfd。
+2026-10-22 已完成 SDK/模块编译及设备缺失拒绝路径检查，驱动运行演示随模块加载后验收。
 
 ### 可选 C++20 协程消费
 
@@ -133,6 +160,8 @@ cmake --build /tmp/selfipcs-async-demo
 
 - `self_ipcs::async::Consumer<T>::create(executor, std::move(consumer))` 同步完成有界通知注册；
   在启动事件循环前准备句柄。适配器拥有 Consumer、通知对象和供 Asio 监听的聚合 FD 副本。
+  选择驱动时使用 `create(executor, std::move(consumer), NotificationBackend::kDriver, timeout)`，
+  复用相同 strand、单次在途等待及取消完成回调回收流程。
 - `async_wait_latest(steady_clock::time_point)` 返回拷贝后的 `Result<Sample<T>>`。
   多个独立通道共享一个 `io_context`；每个句柄通过 strand 串行处理，最多一个在途等待。
 - 数据读取沿用 `drain → try_read_latest`，包括 producer 退出时最后已提交的样本。
@@ -172,21 +201,30 @@ python3 scripts/run_mixed_io_demo.py --binary /tmp/selfipcs-mixed-demo/mixed_io_
 python3 scripts/build_software_notification.py --output-root /tmp
 # headers 使用另一版本 GCC 时增加 --kernel-cc /absolute/path/to/matching-gcc
 # 使用脚本打印的 OUTPUT 绝对目录，由具备模块管理权限的用户执行
-sudo insmod /absolute/OUTPUT/module/self_ipcs_notification.ko
+python3 scripts/manage_software_notification.py status
+sudo python3 scripts/manage_software_notification.py load \
+  --module /absolute/OUTPUT/module/self_ipcs_notification.ko
 sudo /absolute/OUTPUT/self_ipcs_notification_probe --device /dev/self_ipcs_notification
 # 全部使用方退出并关闭 FD 后，正常卸载
-sudo rmmod self_ipcs_notification
+sudo python3 scripts/manage_software_notification.py unload
 ```
 
-UAPI 在 `kernel/notification/include/uapi/`：`read` / `write` 使用本机字节序的固定 8B 无符号计数，
+UAPI 在 `kernel/notification/include/uapi/`，安装入口为 `self_ipcs/notification/driver_uapi.h`。
+只读 `GET_INFO` 返回固定 32B 的 ABI 1 和 counter/STOP 能力；SDK 按此核验模块接口。
+`read` / `write` 使用本机字节序的固定 8B 无符号计数，
 每次成功读取确认当前全部积压；`EFAULT` 保留积压，计数溢出返回 `EOVERFLOW` 并保留原值。
 `O_NONBLOCK` 无可读通知或操作锁暂忙时返回 `EAGAIN`；阻塞读取可由信号中断并返回 `EINTR`。
 `SELF_IPCS_NOTIFICATION_STOP` 为持久停止：唤醒等待者，先排空已有计数，再返回 EOF / poll HUP；
 停止后的写入返回 `EPIPE`。模块以 `THIS_MODULE` 持有引用，最后一个 file 引用释放时回收对象。
 设备默认权限 `0600`，加载受当前系统模块权限和签名策略管理。
+管理脚本校验正在运行的 kernel、headers、模块名与 vermagic，卸载前检查引用数并使用普通
+`rmmod`。构建入口仅编译；加载和卸载由具备权限的操作者显式执行。
 
 有限对照入口 `scripts/run_notification_matrix.py` 与独立验证器
-`scripts/verify_notification_matrix.py` 固定 64B、100/1000Hz、同核/跨核、futex/eventfd 各三轮，
+`scripts/verify_notification_matrix.py` 固定 64B、100/1000Hz、同核/跨核，每后端各三轮。
+默认选择 futex/eventfd；增加 `--backends futex,eventfd,driver` 生成三后端 36 轮配置，
+验证器使用同一显式选择检查范围，并独立核验规范配置与 raw 中的实际后端。
+显式请求 driver 时，设备缺失以具体错误保留为失败轮次。
 保存 raw worker、CSV、工作区间及完整进程生命周期 CPU。正式采集与完整场景/竞态验收在功能集成后统一执行。
 
 ### 队列关闭、批量与 Pool 等待

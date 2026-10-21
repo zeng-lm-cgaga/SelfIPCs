@@ -53,8 +53,9 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 		std::fflush(stdout);
 		return 2;
 	}
-	if (a.notification == edge_tool::BenchNotification::kEventfd) {
-		auto enabled = p.value().enable_event_notifications();
+	if (a.notification != edge_tool::BenchNotification::kFutex) {
+		auto enabled = p.value().enable_event_notifications(
+		        edge_tool::bench_notification_backend(a.notification));
 		if (!enabled) {
 			const auto& error = enabled.error();
 			std::printf("NOTIFICATION_ENABLE_FAIL code=%s errno=%d op=%s ctx=%s\n",
@@ -64,6 +65,9 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 			return 2;
 		}
 	}
+	std::printf("NOTIFICATION_BACKEND requested=%s actual=%s\n",
+	            edge_tool::bench_notification_name(a.notification),
+	            edge_tool::bench_notification_name(a.notification));
 	std::printf("READY generation=%" PRIu64 "\n", p.value().generation());
 	std::fflush(stdout);
 	if (a.ready_fd >= 0) {
@@ -141,7 +145,7 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 	metrics.timeout = a.samples > published ? 1 : 0;
 	metrics.finish();
 	if (publications != nullptr && std::fclose(publications) != 0) return 3;
-	if (a.notification == edge_tool::BenchNotification::kEventfd) {
+	if (a.notification != edge_tool::BenchNotification::kFutex) {
 		const int notification_error = p.value().event_notification_error();
 		if (notification_error != 0) {
 			std::printf("NOTIFICATION_DELIVERY_FAIL errno=%d published=%" PRIu64 "\n",
@@ -164,7 +168,7 @@ int main(int argc, char** argv) {
 		std::fprintf(stderr,
 		             "usage: self_ipcs_shm_bench_producer --name <name> --payload <bytes> "
 		             "[--samples N] [--max-time-ms T] [--rate hz] "
-		             "[--wait-consumer-ms N] [--notification futex|eventfd] [--ready-fd FD] "
+		             "[--wait-consumer-ms N] [--notification futex|eventfd|driver] [--ready-fd FD] "
 		             "[--publish-csv path] [--checksum 1]\n");
 		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}

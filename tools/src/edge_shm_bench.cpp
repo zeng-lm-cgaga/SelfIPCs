@@ -722,7 +722,7 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	cargv.push_back("--csv");
 	cargv.push_back(csv_raw);
 	cargv.push_back("--mode");
-	cargv.push_back(spec.mode == "eventfd" ? "futex" : spec.mode);
+	cargv.push_back(spec.notification != edge_tool::BenchNotification::kFutex ? "futex" : spec.mode);
 	cargv.push_back("--notification");
 	cargv.push_back(edge_tool::bench_notification_name(spec.notification));
 	cargv.push_back("--ready-fd");
@@ -969,13 +969,13 @@ RunSpec spec_of(std::string id, std::string transport, std::string mode, uint32_
 
 std::vector<RunSpec> with_notification(std::vector<RunSpec> runs,
                                      edge_tool::BenchNotification notification) {
-	if (notification == edge_tool::BenchNotification::kEventfd) {
+	if (notification != edge_tool::BenchNotification::kFutex) {
 		for (auto& spec : runs) {
 			if (spec.transport != "shm" || spec.mode != "futex") continue;
 			spec.notification = notification;
-			spec.mode = "eventfd";
+			spec.mode = edge_tool::bench_notification_name(notification);
 			const size_t position = spec.id.find("-futex-");
-			if (position != std::string::npos) spec.id.replace(position, 7, "-eventfd-");
+			if (position != std::string::npos) spec.id.replace(position, 7, "-" + spec.mode + "-");
 		}
 	}
 	return runs;
@@ -1212,8 +1212,8 @@ int main(int argc, char** argv) {
 		             "usage: self_ipcs_shm_bench (--smoke|--evidence|--matrix|--notification-matrix) "
 		             "[--producer <bin>] [--consumer <bin>] [--sock <bin>] "
 		             "[--ctl <bin>] [--out-dir <dir>] [--only <id,...>] "
-		             "[--notification futex|eventfd]\n"
-		             "       eventfd replaces shm futex waits; poll/socket cases are unchanged.\n"
+		             "[--notification futex|eventfd|driver]\n"
+		             "       eventfd/driver replace shm futex waits; poll/socket cases are unchanged.\n"
 		             "       --notification-matrix: 64B, 100/1000Hz, 1000 samples, warm100, 15000ms.\n"
 		             "       --notification-smoke reduces that profile to 50 samples, warm5 (not formal).\n"
 		             "       --list shows the selected notification's run IDs.\n");

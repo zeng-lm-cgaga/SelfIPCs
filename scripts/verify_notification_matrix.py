@@ -37,12 +37,20 @@ EXTRA_USAGE = ("minor_faults", "major_faults", "input_blocks", "output_blocks", 
                "swaps", "messages_sent", "messages_received")
 
 
-def normative_cases(smoke: bool) -> list[dict]:
+def normative_backends(value) -> tuple[str, ...]:
+    require(isinstance(value, list) and bool(value), "invalid backend selection")
+    require(all(isinstance(item, str) for item in value), "invalid backend selection")
+    require(value == [name for name in ("futex", "eventfd", "driver") if name in value],
+            "invalid backend selection")
+    return tuple(value)
+
+
+def normative_cases(smoke: bool, backends: tuple[str, ...] = ("futex", "eventfd")) -> list[dict]:
     result = []
     for repeat in range(1, 2 if smoke else 4):
         for rate in ((100,) if smoke else (100, 1000)):
             for placement in (("same",) if smoke else ("same", "different")):
-                for mode in (("futex", "eventfd") if repeat != 2 else ("eventfd", "futex")):
+                for mode in (backends if repeat != 2 else backends[::-1]):
                     prefix = "notification-smoke" if smoke else "notification"
                     result.append(dict(repeat=repeat, rate_hz=rate, placement=placement,
                                        notification=mode, payload_bytes=64, producers=1, consumers=1,
@@ -83,8 +91,13 @@ def quantiles(values: list[int]) -> dict:
             for percent in (50, 95, 99)}
 
 
-def verify_worker(directory: Path, role: str, case: dict, cpu: int, argv: list[str]) -> dict:
+def verify_worker(directory: Path, role: str, case: dict, cpu: int, argv: list[str],
+                  *, require_backend_identity: bool = False) -> dict:
     text = (directory / f"{role}.raw").read_text()
+    backend_records = [line for line in text.splitlines() if line.startswith("NOTIFICATION_BACKEND ")]
+    if require_backend_identity or case["notification"] == "driver" or backend_records:
+        require(backend_records == [f"NOTIFICATION_BACKEND requested={case['notification']} "
+                                    f"actual={case['notification']}"], "actual backend mismatch or missing")
     metrics = one_record(text, "WORK_METRICS")
     begin, end = one_record(text, "WORK_BEGIN"), one_record(text, "WORK_END")
     lifecycle = load(directory / f"{role}.lifecycle.json")
@@ -104,8 +117,8 @@ def verify_worker(directory: Path, role: str, case: dict, cpu: int, argv: list[s
         require(len({thread["tid"] for thread in threads}) == len(threads), "duplicate TID")
         require(metrics["pid"] in {thread["tid"] for thread in threads}, "missing main thread")
         require(all(thread["cpus"] == [cpu] for thread in threads), "thread actual affinity mismatch")
-        if role == "producer" and case["notification"] == "eventfd":
-            require(len(threads) >= 2, "eventfd producer service thread unaccounted")
+        if role == "producer" and case["notification"] in ("eventfd", "driver"):
+            require(len(threads) >= 2, "notification producer service thread unaccounted")
     duration = end["monotonic_raw_ns"] - begin["monotonic_raw_ns"]
     require(duration > 0 and end["realtime_ns"] >= begin["realtime_ns"], "invalid work interval")
     for key in USAGE + EXTRA_USAGE:
@@ -130,11 +143,14 @@ def verify_worker(directory: Path, role: str, case: dict, cpu: int, argv: list[s
     return dict(metrics=metrics, lifecycle=lifecycle, raw=text)
 
 
-def verify_run(directory: Path, case: dict, cpu_a: int, cpu_b: int) -> dict:
+def verify_run(directory: Path, case: dict, cpu_a: int, cpu_b: int,
+               *, require_backend_identity: bool = False) -> dict:
     workers = load(directory / "workers.argv.json")
-    producer = verify_worker(directory, "producer", case, cpu_a, workers["producer"])
+    producer = verify_worker(directory, "producer", case, cpu_a, workers["producer"],
+                             require_backend_identity=require_backend_identity)
     consumer = verify_worker(directory, "consumer", case,
-                             cpu_a if case["placement"] == "same" else cpu_b, workers["consumer"])
+                             cpu_a if case["placement"] == "same" else cpu_b, workers["consumer"],
+                             require_backend_identity=require_backend_identity)
     published, consumed = producer["metrics"], consumer["metrics"]
     require(published["pid"] != consumed["pid"], "workers are not separate processes")
     owned = load(directory / "owned-resources.json")
@@ -262,15 +278,20 @@ def verify_run(directory: Path, case: dict, cpu_a: int, cpu_b: int) -> dict:
             "workers": {"producer": published, "consumer": consumed}}
 
 
-def verify(root: Path, *, allow_smoke: bool = False) -> dict:
+def verify(root: Path, *, allow_smoke: bool = False,
+           expected_backends: tuple[str, ...] | None = None) -> dict:
     plan, manifest = load(root / "plan.json"), load(root / "manifest.json")
     smoke = plan["smoke"]
     require(type(smoke) is bool and (not smoke or allow_smoke), "smoke is not formal evidence")
-    expected = normative_cases(smoke)
+    require(plan["schema"] in (1, 2), "unsupported matrix schema")
+    backends = normative_backends(plan.get("backends")) if plan["schema"] == 2 else ("futex", "eventfd")
+    if expected_backends is not None:
+        require(backends == expected_backends, "requested backend scope mismatch")
+    expected = normative_cases(smoke, backends)
     rules = dict(RULES)
     if smoke:
         rules.update(accepted_publications=50, warmup_observations=5, minimum_postwarm_observations=45)
-    require(plan["schema"] == 1 and plan["cases"] == expected, "normative matrix config mismatch")
+    require(plan["cases"] == expected, "normative matrix config mismatch")
     require(plan["rules"] == rules and plan["serial"] is True and plan["watchdog_s"] == 60,
             "immutable eligibility/window rules mismatch")
     require(load(root / "plan.sha256.json")["sha256"] == sha(root / "plan.json"), "plan digest mismatch")
@@ -313,7 +334,8 @@ def verify(root: Path, *, allow_smoke: bool = False) -> dict:
                     "driver profile mismatch")
             require(sorted(path.name for path in (directory / "output").iterdir() if path.is_dir()) == [case["run_id"]],
                     "unexpected/missing worker output")
-            result = verify_run(directory / "output" / case["run_id"], case, plan["cpu_a"], plan["cpu_b"])
+            result = verify_run(directory / "output" / case["run_id"], case, plan["cpu_a"], plan["cpu_b"],
+                                require_backend_identity=plan["schema"] == 2)
             summary = load(directory / "output" / case["run_id"] / "summary.json")
             require(summary["git_commit"] == manifest["head"] + (" (dirty)" if manifest["status"] else ""),
                     "driver source identity mismatch")
@@ -337,7 +359,8 @@ def verify(root: Path, *, allow_smoke: bool = False) -> dict:
         except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
             result = {"integrity": False, "eligible": False, "errors": [str(error)]}
         results.append({"ordinal": ordinal, "case": case, **result})
-    return {"schema": 1, "formal": not smoke, "integrity": all(item["integrity"] for item in results),
+    return {"schema": 2, "formal": not smoke, "backends": list(backends), "expected_runs": len(expected),
+            "integrity": all(item["integrity"] for item in results),
             "all_eligible": all(item["eligible"] for item in results), "runs": results}
 
 
@@ -347,9 +370,11 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allow-smoke", action="store_true")
     parser.add_argument("--require-eligible", action="store_true")
+    parser.add_argument("--backends", help="require this canonical backend scope, e.g. futex,eventfd,driver")
     args = parser.parse_args()
     try:
-        result = verify(args.input_root.resolve(), allow_smoke=args.allow_smoke)
+        scope = normative_backends(args.backends.split(",")) if args.backends is not None else None
+        result = verify(args.input_root.resolve(), allow_smoke=args.allow_smoke, expected_backends=scope)
     except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
         result = {"integrity": False, "all_eligible": False, "errors": [str(error)]}
     with args.output.open("x") as output:

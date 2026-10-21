@@ -80,8 +80,9 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 		return 2;
 	}
 	std::optional<edge_runtime::EventNotification> notification;
-	if (a.notification == edge_tool::BenchNotification::kEventfd) {
-		auto registered = consumer.value().event_notification(std::chrono::milliseconds(1000));
+	if (a.notification != edge_tool::BenchNotification::kFutex) {
+		auto registered = consumer.value().event_notification(
+		        edge_tool::bench_notification_backend(a.notification), std::chrono::milliseconds(1000));
 		if (!registered) {
 			const auto& error = registered.error();
 			std::printf("NOTIFICATION_REGISTER_FAIL code=%s errno=%d op=%s ctx=%s\n",
@@ -91,7 +92,15 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 			return 2;
 		}
 		notification.emplace(std::move(registered.value()));
+		if (notification->backend() != edge_tool::bench_notification_backend(a.notification)) {
+			std::fprintf(stderr, "NOTIFICATION_BACKEND_MISMATCH\n");
+			return 2;
+		}
 	}
+	std::printf("NOTIFICATION_BACKEND requested=%s actual=%s\n",
+	            edge_tool::bench_notification_name(a.notification),
+	            notification ? (notification->backend() == edge_runtime::NotificationBackend::kDriver
+	                                    ? "driver" : "eventfd") : "futex");
 	FILE* csv = std::fopen(a.csv_path.c_str(), "w");
 	if (csv == nullptr) {
 		std::fprintf(stderr, "cannot open --csv %s\n", a.csv_path.c_str());
@@ -257,7 +266,7 @@ int main(int argc, char** argv) {
 		             "usage: self_ipcs_shm_bench_consumer --name <name> --payload <bytes> "
 		             "--csv <path> [--mode futex|poll] [--max-samples N] "
 		             "[--max-time-ms T] [--idle-ms N] [--poll-bound N] "
-		             "[--open-retry-ms N] [--notification futex|eventfd] [--ready-fd FD] "
+		             "[--open-retry-ms N] [--notification futex|eventfd|driver] [--ready-fd FD] "
 		             "[--final-sequence N] [--rate hz] [--checksum 1]\n");
 		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
@@ -268,9 +277,9 @@ int main(int argc, char** argv) {
 	a.use_wait = mode == nullptr || std::string(mode) == "futex";
 	a.notification = edge_tool::bench_notification_from_args(argc, argv);
 	a.ready_fd = edge_tool::bench_ready_fd_from_args(argc, argv);
-	if (!a.use_wait && a.notification == edge_tool::BenchNotification::kEventfd) {
+	if (!a.use_wait && a.notification != edge_tool::BenchNotification::kFutex) {
 		std::fprintf(stderr,
-		             "--notification eventfd requires --mode futex (or the default mode)\n");
+		             "--notification eventfd|driver requires --mode futex (or the default mode)\n");
 		return 2;
 	}
 	const char* csv = edge_tool::arg_value(argc, argv, "--csv");
