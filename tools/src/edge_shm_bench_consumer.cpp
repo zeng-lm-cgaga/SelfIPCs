@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "edge_runtime_tool/bench_notification.hpp"
+#include "edge_runtime_tool/notification_metrics.hpp"
 #include "edge_runtime_tool/bench_payload.hpp"
 #include "edge_runtime/channel/channel_options.hpp"
 #include "edge_runtime/channel/consumer.hpp"
@@ -43,6 +44,8 @@ struct Args {
 	uint64_t open_retry_ms = 10000;
 	bool checksum = true;
 	int ready_fd = -1;
+	uint64_t final_sequence = 0;
+	uint64_t rate_hz = 0;
 };
 
 template <size_t N>
@@ -94,6 +97,9 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 		std::fprintf(stderr, "cannot open --csv %s\n", a.csv_path.c_str());
 		return 2;
 	}
+	edge_tool::NotificationMetrics metrics(
+	        "consumer", edge_tool::bench_notification_name(a.notification), N,
+	        a.final_sequence > 0 ? a.final_sequence : a.max_samples, a.rate_hz);
 	if (!edge_tool::bench_signal_ready(a.ready_fd)) {
 		std::fprintf(stderr, "NOTIFICATION_READY_FAIL\n");
 		std::fclose(csv);
@@ -128,6 +134,7 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	for (;;) {
 		const int64_t now_ms = edge_tool::monotonic_ms_now();
 		if (deadline_ms != 0 && now_ms >= deadline_ms) {
+			++metrics.timeout;
 			ended = "time";
 			break;
 		}
@@ -149,18 +156,31 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 		if (snap) {
 			const uint64_t receive_ns = monotonic_raw_now_ns();
 			empty_polls = 0;
+			if (snap.value().sequence <= last_seq) ++metrics.duplicate;
+			else ++metrics.unique_consumed;
+			if (snap.value().value.counter + 1 != snap.value().sequence) {
+				++metrics.torn;
+				++torn;
+			}
 			last_seq = snap.value().sequence;
 			missed_total += snap.value().missed_samples;
 			write_row(snap.value(), receive_ns);
 			++reads;
+			metrics.consumed = reads;
+			metrics.final_sequence = last_seq;
+			metrics.missed = missed_total;
 			last_sample_raw = receive_ns;
-			if (a.max_samples > 0 && reads >= a.max_samples) {
+			if ((a.final_sequence > 0 && last_seq >= a.final_sequence) ||
+			    (a.final_sequence == 0 && a.max_samples > 0 && reads >= a.max_samples)) {
 				ended = "samples";
 				break;
 			}
 			continue;
 		}
 		const edge_runtime::ErrorCode ec = snap.error().code;
+		if (ec == edge_runtime::ErrorCode::kNoNewSample && a.use_wait && !notification) {
+			++metrics.wait_timeouts;
+		}
 		if (ec == edge_runtime::ErrorCode::kNoNewSample ||
 		    ec == edge_runtime::ErrorCode::kReadContention) {
 			if (reads > 0 && a.idle_ms > 0 && last_sample_raw != 0) {
@@ -181,6 +201,7 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 				}
 				struct pollfd descriptor {notification->native_handle(), POLLIN, 0};
 				const int ready = ::poll(&descriptor, 1, static_cast<int>(wait_ms));
+				if (ready == 0) ++metrics.wait_timeouts;
 				if ((ready < 0 && errno != EINTR) || (descriptor.revents & POLLNVAL) != 0) {
 					std::printf("NOTIFICATION_POLL_FAIL errno=%d revents=%d\n",
 					            ready < 0 ? errno : EBADF,
@@ -202,6 +223,7 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 		} else if (ec == edge_runtime::ErrorCode::kPayloadCorrupt ||
 		           ec == edge_runtime::ErrorCode::kPayloadDecodeFailed) {
 			++torn;
+			++metrics.torn;
 			break;
 		} else {
 			std::printf("READ_ERROR code=%s seq=%" PRIu64 "\n",
@@ -212,7 +234,11 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 		}
 	}
 
-	std::fclose(csv);
+	if (a.final_sequence > 0 && last_seq < a.final_sequence && metrics.timeout == 0) {
+		++metrics.timeout;
+	}
+	metrics.finish();
+	if (std::fclose(csv) != 0) return 3;
 	const uint64_t end_cpu = cpu_us_now();
 	const uint64_t elapsed_ms = static_cast<uint64_t>(edge_tool::monotonic_ms_now() - start_ms);
 	std::printf("SUMMARY reads=%" PRIu64 " torn=%" PRIu64 " missed_total=%" PRIu64
@@ -231,7 +257,8 @@ int main(int argc, char** argv) {
 		             "usage: self_ipcs_shm_bench_consumer --name <name> --payload <bytes> "
 		             "--csv <path> [--mode futex|poll] [--max-samples N] "
 		             "[--max-time-ms T] [--idle-ms N] [--poll-bound N] "
-		             "[--open-retry-ms N] [--notification futex|eventfd] [--ready-fd FD] [--checksum 1]\n");
+		             "[--open-retry-ms N] [--notification futex|eventfd] [--ready-fd FD] "
+		             "[--final-sequence N] [--rate hz] [--checksum 1]\n");
 		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 	Args a;
@@ -258,6 +285,8 @@ int main(int argc, char** argv) {
 	a.poll_bound = arg_u64(argc, argv, "--poll-bound", 1024);
 	a.open_retry_ms = arg_u64(argc, argv, "--open-retry-ms", 10000);
 	a.checksum = edge_tool::mandatory_payload_checksum(argc, argv);
+	a.final_sequence = arg_u64(argc, argv, "--final-sequence", 0);
+	a.rate_hz = arg_u64(argc, argv, "--rate", 0);
 
 	const edge_runtime::SchemaDescriptor schema{bench::bench_fingerprint(a.payload), 1,
 	                                            "BenchPayloadV1"};

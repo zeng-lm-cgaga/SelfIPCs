@@ -24,6 +24,7 @@
 
 #include "edge_runtime_tool/bench_notification.hpp"
 #include "edge_runtime_tool/bench_child.hpp"
+#include "edge_runtime_tool/notification_metrics.hpp"
 #include "edge_runtime_tool/tool_common.hpp"
 
 namespace {
@@ -47,6 +48,7 @@ struct RunSpec {
 	uint64_t max_time_ms = 60000;
 	uint64_t warmup = 10000;
 	bool require_comparable = false;
+	bool notification_matrix = false;
 };
 
 struct Config {
@@ -355,6 +357,21 @@ void write_environment(const Config& cfg, const RunSpec& spec, const std::string
 	}
 }
 
+std::string quoted_json(const std::string& value) {
+	std::string result = "\"";
+	for (const unsigned char character : value) {
+		if (character == '"' || character == '\\') result += '\\';
+		if (character < 32) {
+			char escaped[7];
+			std::snprintf(escaped, sizeof(escaped), "\\u%04x", static_cast<unsigned>(character));
+			result += escaped;
+		} else {
+			result += static_cast<char>(character);
+		}
+	}
+	return result + "\"";
+}
+
 void write_command(const RunSpec& spec, const std::string& dir,
                    const std::vector<std::string>& producer_argv,
                    const std::vector<std::string>& consumer_argv) {
@@ -370,6 +387,44 @@ void write_command(const RunSpec& spec, const std::string& dir,
 		std::fwrite(s.data(), 1, s.size(), f);
 		std::fclose(f);
 	}
+	FILE* arguments = std::fopen((dir + "/workers.argv.json").c_str(), "w");
+	if (arguments != nullptr) {
+		std::fputs("{", arguments);
+		const std::vector<std::pair<const char*, const std::vector<std::string>*>> roles = {
+		        {"producer", &producer_argv}, {"consumer", &consumer_argv}};
+		for (size_t index = 0; index < roles.size(); ++index) {
+			std::fprintf(arguments, "%s\"%s\":[", index == 0 ? "" : ",", roles[index].first);
+			const auto& argv = *roles[index].second;
+			for (size_t position = 0; position < argv.size(); ++position) {
+				std::fprintf(arguments, "%s%s", position == 0 ? "" : ",", quoted_json(argv[position]).c_str());
+			}
+			std::fputs("]", arguments);
+		}
+		std::fputs("}\n", arguments);
+		std::fclose(arguments);
+	}
+	if (spec.notification_matrix) {
+		const auto name_arg = std::find(producer_argv.begin(), producer_argv.end(), "--name");
+		if (name_arg == producer_argv.end() || name_arg + 1 == producer_argv.end()) return;
+		const std::string name = *(name_arg + 1);
+		const std::string control = "/run/user/" + std::to_string(::getuid()) + "/edgeruntime/" + name;
+		const std::vector<std::string> paths = {
+		        "/dev/shm/edgeruntime." + std::to_string(::getuid()) + "." + name,
+		        control + ".lock", control + ".sock", control + ".sock.notify"};
+		FILE* owned = std::fopen((dir + "/owned-resources.json").c_str(), "w");
+		if (owned != nullptr) {
+			std::fprintf(owned, "{\"channel\":%s,\"paths\":[", quoted_json(name).c_str());
+			for (size_t index = 0; index < paths.size(); ++index) {
+				struct stat status{};
+				const bool exists = ::lstat(paths[index].c_str(), &status) == 0;
+				std::fprintf(owned, "%s{\"path\":%s,\"existed_before\":%s}",
+				             index == 0 ? "" : ",", quoted_json(paths[index]).c_str(),
+				             exists ? "true" : "false");
+			}
+			std::fputs("]}\n", owned);
+			std::fclose(owned);
+		}
+	}
 }
 
 void write_process_status(const Config&, const std::string& dir, const ChildResult& prod,
@@ -382,6 +437,27 @@ void write_process_status(const Config&, const std::string& dir, const ChildResu
 			const auto& child = *children[index];
 			std::fwrite(child.out.data(), 1, child.out.size(), output);
 			std::fclose(output);
+		}
+		const auto& child = *children[index];
+		FILE* lifecycle = std::fopen((dir + "/" + roles[index] + ".lifecycle.json").c_str(), "w");
+		if (lifecycle != nullptr) {
+			std::fprintf(lifecycle,
+			             "{\"scope\":\"wait4_process_lifecycle\",\"exit_code\":%d,"
+			             "\"signal\":%d,\"timed_out\":%s,\"exec_ok\":%s,\"wall_us\":%" PRIu64
+			             ",\"user_us\":%" PRIu64 ",\"system_us\":%" PRIu64
+			             ",\"voluntary_csw\":%ld,\"involuntary_csw\":%ld,"
+			             "\"minor_faults\":%ld,\"major_faults\":%ld,\"maxrss_kb\":%ld,"
+			             "\"input_blocks\":%ld,\"output_blocks\":%ld,\"signals\":%ld,"
+			             "\"swaps\":%ld,\"messages_sent\":%ld,\"messages_received\":%ld}\n",
+			             child.exit_code, child.signum, child.timed_out ? "true" : "false",
+			             child.exec_ok ? "true" : "false", child.wall_us,
+			             edge_tool::notification_timeval_us(child.ru.ru_utime),
+			             edge_tool::notification_timeval_us(child.ru.ru_stime),
+			             child.ru.ru_nvcsw, child.ru.ru_nivcsw, child.ru.ru_minflt,
+			             child.ru.ru_majflt, child.ru.ru_maxrss, child.ru.ru_inblock,
+			             child.ru.ru_oublock, child.ru.ru_nsignals, child.ru.ru_nswap,
+			             child.ru.ru_msgsnd, child.ru.ru_msgrcv);
+			std::fclose(lifecycle);
 		}
 	}
 	std::string s;
@@ -553,7 +629,6 @@ void write_result_md(const RunSpec& spec, const std::string& dir, const LatencyS
 
 bool compose_samples_csv(const std::string& dir, const std::vector<RawSample>& rows,
                          uint64_t producer_cpu_us, uint64_t consumer_cpu_us) {
-	const std::string raw = dir + "/samples.raw.csv";
 	const std::string final = dir + "/samples.csv";
 	FILE* f = std::fopen(final.c_str(), "w");
 	if (f == nullptr) return false;
@@ -569,7 +644,6 @@ bool compose_samples_csv(const std::string& dir, const std::vector<RawSample>& r
 		             s.missed, producer_cpu_us, consumer_cpu_us);
 	}
 	std::fclose(f);
-	::unlink(raw.c_str());
 	return true;
 }
 
@@ -629,6 +703,10 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	}
 	pargv.push_back("--checksum");
 	pargv.push_back("1");
+	if (spec.notification_matrix) {
+		pargv.push_back("--publish-csv");
+		pargv.push_back(dir + "/publications.csv");
+	}
 
 	std::vector<std::string> cargv;
 	const std::string cp = placement_prefix(cfg, spec, false);
@@ -655,6 +733,12 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	cargv.push_back(std::to_string(spec.max_time_ms));
 	cargv.push_back("--checksum");
 	cargv.push_back("1");
+	if (spec.notification_matrix) {
+		cargv.push_back("--final-sequence");
+		cargv.push_back(std::to_string(spec.samples));
+		cargv.push_back("--rate");
+		cargv.push_back(std::to_string(spec.rate_hz));
+	}
 
 	write_command(spec, dir, pargv, cargv);
 
@@ -671,7 +755,8 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 
 	std::vector<RawSample> rows;
 	parse_raw_csv(csv_raw, &rows);
-	const size_t warmup = spec.warmup <= rows.size() ? spec.warmup : 0;
+	const size_t warmup = spec.notification_matrix ? std::min<size_t>(spec.warmup, rows.size()) :
+	                                               (spec.warmup <= rows.size() ? spec.warmup : 0);
 	const LatencyStats st = compute_stats(rows, warmup);
 
 	const uint64_t missed_total = cm.missed_total;
@@ -909,6 +994,24 @@ std::vector<RunSpec> smoke_specs() {
 	};
 }
 
+std::vector<RunSpec> notification_specs(bool smoke) {
+	std::vector<RunSpec> runs;
+	for (const auto rate : {100, 1000}) {
+		for (const char* placement : {"same", "different"}) {
+			if (smoke && (rate != 100 || std::string(placement) != "same")) continue;
+			auto spec = spec_of(std::string(smoke ? "notification-smoke" : "notification") +
+			                            "-shm-futex-64B-" + std::string(placement) + "-" +
+			                            std::to_string(rate),
+			                    "shm", "futex", 64, placement, std::to_string(rate),
+			                    static_cast<uint64_t>(rate), smoke ? 50 : 1000,
+			                    smoke ? 2000 : 15000, smoke ? 5 : 100);
+			spec.notification_matrix = true;
+			runs.push_back(std::move(spec));
+		}
+	}
+	return runs;
+}
+
 std::vector<RunSpec> evidence_specs() {
 	return {
 
@@ -1065,13 +1168,32 @@ int main(int argc, char** argv) {
 	bool want_smoke = edge_tool::arg_flag(argc, argv, "--smoke");
 	bool want_evidence = edge_tool::arg_flag(argc, argv, "--evidence");
 	bool want_matrix = edge_tool::arg_flag(argc, argv, "--matrix");
+	bool want_notification = edge_tool::arg_flag(argc, argv, "--notification-matrix");
+	const bool notification_smoke = edge_tool::arg_flag(argc, argv, "--notification-smoke");
+	if (notification_smoke && !want_notification) {
+		std::fprintf(stderr, "--notification-smoke requires --notification-matrix\n");
+		return 2;
+	}
+	if (want_notification && (want_smoke || want_evidence || want_matrix)) {
+		std::fprintf(stderr, "--notification-matrix cannot be combined with other profiles\n");
+		return 2;
+	}
 	bool want_list = edge_tool::arg_flag(argc, argv, "--list");
 	const char* only = edge_tool::arg_value(argc, argv, "--only");
 	const auto notification = edge_tool::bench_notification_from_args(argc, argv);
 
 	const bool has_helpers =
-	        !cfg.producer_bin.empty() && !cfg.consumer_bin.empty() && !cfg.sock_bin.empty();
+	        !cfg.producer_bin.empty() && !cfg.consumer_bin.empty() &&
+	        (want_notification || !cfg.sock_bin.empty());
 	if (want_list) {
+		if (want_notification) {
+			for (const auto& spec :
+			     with_notification(notification_specs(notification_smoke), notification)) {
+				std::printf("%s samples=%" PRIu64 " warmup=%" PRIu64 " max_time_ms=%" PRIu64 "\n",
+				            spec.id.c_str(), spec.samples, spec.warmup, spec.max_time_ms);
+			}
+			return 0;
+		}
 		for (const auto& s : with_notification(smoke_specs(), notification)) {
 			std::printf("%-40s %-6s %-5s %6uB %-10s %-6s\n", s.id.c_str(),
 			            s.transport.c_str(), s.mode.c_str(), s.payload,
@@ -1087,13 +1209,19 @@ int main(int argc, char** argv) {
 	}
 	if (edge_tool::arg_flag(argc, argv, "--help") || !has_helpers) {
 		std::fprintf(stderr,
-		             "usage: self_ipcs_shm_bench (--smoke|--evidence|--matrix) "
+		             "usage: self_ipcs_shm_bench (--smoke|--evidence|--matrix|--notification-matrix) "
 		             "[--producer <bin>] [--consumer <bin>] [--sock <bin>] "
 		             "[--ctl <bin>] [--out-dir <dir>] [--only <id,...>] "
 		             "[--notification futex|eventfd]\n"
 		             "       eventfd replaces shm futex waits; poll/socket cases are unchanged.\n"
+		             "       --notification-matrix: 64B, 100/1000Hz, 1000 samples, warm100, 15000ms.\n"
+		             "       --notification-smoke reduces that profile to 50 samples, warm5 (not formal).\n"
 		             "       --list shows the selected notification's run IDs.\n");
 		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
+	}
+	if (want_notification && (!cfg.taskset_ok_a || !cfg.taskset_ok_b || cfg.cpu_a == cfg.cpu_b)) {
+		std::fprintf(stderr, "notification profile requires two distinct available CPUs\n");
+		return 2;
 	}
 
 	const std::vector<std::string> git = {"git", "-C", cfg.git_dir, "rev-parse", "HEAD"};
@@ -1121,7 +1249,9 @@ int main(int argc, char** argv) {
 	cfg.perf_ok = pr.exec_ok && pr.exit_code == 0 && pr.out.find("Error") == std::string::npos;
 
 	std::vector<RunSpec> runs;
-	if (want_smoke)
+	if (want_notification)
+		runs = notification_specs(notification_smoke);
+	else if (want_smoke)
 		runs = smoke_specs();
 	else if (want_evidence)
 		runs = evidence_specs();

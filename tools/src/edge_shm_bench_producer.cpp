@@ -6,6 +6,7 @@
 #include <string>
 
 #include "edge_runtime_tool/bench_notification.hpp"
+#include "edge_runtime_tool/notification_metrics.hpp"
 #include "edge_runtime_tool/bench_payload.hpp"
 #include "edge_runtime/channel/channel_options.hpp"
 #include "edge_runtime/channel/channel_layout.hpp"
@@ -34,6 +35,7 @@ struct Args {
 	int ready_fd = -1;
 	edge_tool::BenchNotification notification = edge_tool::BenchNotification::kFutex;
 	bool checksum = true;
+	std::string publish_csv;
 };
 
 template <size_t N>
@@ -93,6 +95,14 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 		}
 	}
 
+	FILE* publications = nullptr;
+	if (!a.publish_csv.empty()) {
+		publications = std::fopen(a.publish_csv.c_str(), "w");
+		if (publications == nullptr) return 2;
+		std::fputs("attempt,sequence,publish_ns,accepted\n", publications);
+	}
+	edge_tool::NotificationMetrics metrics(
+	        "producer", edge_tool::bench_notification_name(a.notification), N, a.samples, a.rate_hz);
 	const int64_t deadline_ms = a.max_time_ms > 0 ? edge_tool::monotonic_ms_now() +
 	                                                        static_cast<int64_t>(a.max_time_ms)
 	                                              : 0;
@@ -107,19 +117,30 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 		bench::BenchPayloadV1<N> v{};
 		v.counter = published;
 		v.publish_ns = publish_ns;
+		++metrics.attempted;
 		auto r = p.value().publish(v);
+		if (publications != nullptr) {
+			std::fprintf(publications, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d\n",
+			             metrics.attempted, published + 1, publish_ns, r ? 1 : 0);
+		}
 		if (!r) {
+			if (publications != nullptr) std::fclose(publications);
 			std::printf("PUBLISH_FAIL code=%s published=%" PRIu64 "\n",
 			            edge_runtime::to_string(r.error().code), published);
 			std::fflush(stdout);
 			return 3;
 		}
 		++published;
+		metrics.accepted = published;
+		metrics.final_sequence = published;
 		if (a.samples > 0 && published >= a.samples) break;
 		if (deadline_ms != 0 && edge_tool::monotonic_ms_now() >= deadline_ms) break;
 	}
 
 	const uint64_t end_cpu = cpu_us_now();
+	metrics.timeout = a.samples > published ? 1 : 0;
+	metrics.finish();
+	if (publications != nullptr && std::fclose(publications) != 0) return 3;
 	if (a.notification == edge_tool::BenchNotification::kEventfd) {
 		const int notification_error = p.value().event_notification_error();
 		if (notification_error != 0) {
@@ -143,7 +164,8 @@ int main(int argc, char** argv) {
 		std::fprintf(stderr,
 		             "usage: self_ipcs_shm_bench_producer --name <name> --payload <bytes> "
 		             "[--samples N] [--max-time-ms T] [--rate hz] "
-		             "[--wait-consumer-ms N] [--notification futex|eventfd] [--ready-fd FD] [--checksum 1]\n");
+		             "[--wait-consumer-ms N] [--notification futex|eventfd] [--ready-fd FD] "
+		             "[--publish-csv path] [--checksum 1]\n");
 		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 	Args a;
@@ -156,6 +178,7 @@ int main(int argc, char** argv) {
 	a.notification = edge_tool::bench_notification_from_args(argc, argv);
 	a.ready_fd = edge_tool::bench_ready_fd_from_args(argc, argv);
 	a.checksum = edge_tool::mandatory_payload_checksum(argc, argv);
+	if (const char* path = arg_value(argc, argv, "--publish-csv")) a.publish_csv = path;
 
 	const edge_runtime::SchemaDescriptor schema{bench::bench_fingerprint(a.payload), 1,
 	                                            "BenchPayloadV1"};
