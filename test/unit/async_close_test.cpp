@@ -36,7 +36,7 @@ boost::asio::awaitable<bool> finish_read(Pending pending, int* completed) {
 
 boost::asio::awaitable<bool> finish_close(Async* consumer, const int* read_completed) {
 	auto closed = co_await consumer->async_close();
-	co_return closed&&* read_completed == 1;
+	co_return closed && *read_completed == 1;
 }
 
 class AsyncClose : public ::testing::Test {
