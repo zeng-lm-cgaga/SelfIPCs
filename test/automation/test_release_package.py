@@ -274,6 +274,17 @@ elif a[:2] not in (['release', 'create'], ['release', 'edit']):
         self.assertNotIn(['release', 'create'], events)
         self.assertNotIn(['release', 'edit'], events)
 
+    def test_release_notes_describe_current_validation_scope(self):
+        result, _ = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        calls = [json.loads(line) for line in self.events.read_text().splitlines()]
+        create = next(args for args in calls if args[:2] == ['release', 'create'])
+        notes = create[create.index('--notes') + 1]
+        self.assertIn('Ubuntu 22.04', notes)
+        self.assertNotIn('24.04', notes)
+        self.assertIn('KASAN/lockdep are deferred', notes)
+        self.assertIn('Linux VM', notes)
+
     def test_failed_download_verification_keeps_draft(self):
         result, events = self.invoke(MOCK_CORRUPT="1")
         self.assertNotEqual(result.returncode, 0)

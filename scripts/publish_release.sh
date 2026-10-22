@@ -23,7 +23,7 @@ fi
 
 gh release create "$RELEASE_TAG" "$RELEASE_ASSETS"/* \
   --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "SelfIPCs $RELEASE_TAG" \
-  --notes 'Linux x86_64 C++17 library, built on Ubuntu 22.04. Includes the installed SDK, code-only source archive, SHA256SUMS and build manifest. Debug, ASan/UBSan, the complete crash matrix and relocated downstream consumers passed on Ubuntu 22.04 and 24.04. Verify downloads with sha256sum -c SHA256SUMS. Usage and build requirements are in README.md.'
+  --notes 'Linux x86_64 C++17 IPC SDK with SPSC latest-value channels, bounded MPMC queues and shared buffer pools. Version 0.5.0 adds queue close/cancellation/batches, Pool waiting, optional eventfd/driver notifications and a source-build C++20 Asio component. Includes the installed SDK, code-only source archive, SHA256SUMS and build manifest. Debug, ASan/UBSan, the complete C01-C23 crash matrix, relocated downstream consumers and benchmark integrity checks run on Ubuntu 22.04. Real-driver lifecycle/concurrency and three-backend measurements were separately validated in the Linux VM described in README.md. KASAN/lockdep are deferred driver-enhancement checks. Verify downloads with sha256sum -c SHA256SUMS. Usage, ABI 3 migration and measurement conditions are in README.md.'
 
 download_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/selfipcs-release-verify.XXXXXXXX")"
 gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$download_dir"

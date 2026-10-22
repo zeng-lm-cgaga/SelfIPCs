@@ -1,6 +1,8 @@
-# SelfIPCs
+# SelfIPCs｜Linux C++17 进程间通信库（SDK）
 
-面向同机 Linux 进程的 **C++17 共享内存 IPC 库**，用于连续状态、离散任务和大块数据传递。
+面向同机 Linux 进程的 **C++17 共享内存 IPC 库**，以 SDK 形式交付，用于连续状态、离散任务和大块数据传递。
+
+SDK 提供公共 API、静态库、CMake 包及诊断工具，支持独立工程通过 `find_package(SelfIPCs CONFIG REQUIRED)` 接入；CI/CD 负责自动测试、打包和版本发布。
 
 ## 核心能力
 
@@ -139,7 +141,7 @@ auto notification = consumer.event_notification(self_ipcs::NotificationBackend::
 安装后的 `notification_demo --backend driver` 及 `async_consume_demo --backend driver`
 提供真实 fork/exec、独立打开通道和生命周期演示；默认参数使用 eventfd。
 2026-10-22 已在 Linux VM 实测驱动通知、独立进程与安装包消费、普通账号和 systemd 服务，
-并验证设备缺失/权限拒绝、争用及正常卸载；测试后的临时设备授权已恢复。调试内核检查另行验收。
+并验证设备缺失/权限拒绝、争用及正常卸载；测试后的临时设备授权已恢复。驱动专项覆盖见下方验证记录。
 
 ### 可选 C++20 协程消费
 
@@ -301,7 +303,8 @@ driver 使用 UAPI 1 模块，vermagic 匹配运行内核。独立验证确认36
 consumer为1线程、producer含控制服务共2线程。CPU通过同UID进程的POSIX CPU clock读取。
 补充的持续可读饱和、公平有界批次、stop四源同时就绪及producer退出最终样本用例，已在
 Release与ASan/UBSan完成验证。真实驱动probe、Debug与ASan/UBSan各8项跨进程测试、
-两套搬移安装的新旧通知/协程入口共8组完成；KASAN/lockdep运行验收待对应配置的调试内核。
+两套搬移安装的新旧通知/协程入口共8组完成。KASAN/lockdep列为后续驱动增强验证，
+本版本采用上述普通内核上的真实驱动、生命周期、并发和安装消费验证范围。
 
 ```bash
 python3 -B scripts/run_notification_matrix.py --binary-dir build/selfipcs-release/tools \
@@ -317,7 +320,7 @@ python3 -B scripts/verify_notification_matrix.py \
 MPMC 和 SharedBufferPool 新建实例使用 **ABI 3.0**；新旧库在 `open` 时按 major 显式拒绝
 ABI 2.0/3.0 混用，返回 `AbiMismatch`。升级时先由原 creator 按所有权排空、释放并移除旧实例，
 再创建新实例。SPSC 布局、`BufferHandle` 的 88B 结构、共享对象命名和身份校验沿用现有契约。
-本分支使用 CMake/安装包 **0.5.0 本地候选版本**，对应 ABI 3、可选通知后端及 C++20 async 组件；
+本版本使用 CMake/安装包 **0.5.0**，对应 ABI 3、可选通知后端及 C++20 async 组件；
 具体实现与验收由源码提交和产物 SHA 标识。历史已发布 `v0.4.0` 及其 ABI 2 内容、下载产物和
 验收记录保留原归属。应用升级时按上述实例迁移顺序切换队列与 Pool。
 
@@ -416,14 +419,14 @@ CI 保存 JUnit、执行日志及崩溃现场 14 天；benchmark 保存环境、
 
 发布产物包括 `SelfIPCs-X.Y.Z-linux-x86_64.tar.gz`、`SelfIPCs-X.Y.Z-source.tar.gz`、`release-manifest.json` 和 `SHA256SUMS`。预编译包基于 Ubuntu 22.04、GCC 11/glibc 2.35，包含静态库、公共头、CMake 包和工具。源码包按代码路径白名单生成，文档仅含 README。CD 负责库安装包分发，业务服务由使用该库的应用部署。
 
-历史 `v0.4.0` 可从 [Releases](https://github.com/zeng-lm-cgaga/SelfIPCs/releases) 下载四个文件后执行；
-当前 0.5.0 候选按上文源码构建与安装命令集成：
+从 [v0.5.0 Release](https://github.com/zeng-lm-cgaga/SelfIPCs/releases/tag/v0.5.0)
+下载四个文件后校验并集成；源码构建与可选组件按上文命令安装：
 
 ```bash
 sha256sum -c SHA256SUMS
-tar -xzf SelfIPCs-0.4.0-linux-x86_64.tar.gz
+tar -xzf SelfIPCs-0.5.0-linux-x86_64.tar.gz
 cmake -S /path/to/your/app -B build \
-  -DCMAKE_PREFIX_PATH="$PWD/SelfIPCs-0.4.0-linux-x86_64"
+  -DCMAKE_PREFIX_PATH="$PWD/SelfIPCs-0.5.0-linux-x86_64"
 ```
 
 维护者在确认 `main`、`CMakeLists.txt` 版本和对应验收记录后，为发布版本创建对应标签。
