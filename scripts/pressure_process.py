@@ -33,6 +33,30 @@ def child_snapshot(pid: int) -> list[int]:
         return []
 
 
+def affinity_snapshot(pid: int) -> dict:
+    started = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    observation = {"pid": pid, "schema": 2, "begin_ns": started}
+    process = Path(f"/proc/{pid}")
+    try:
+        identity = (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        argv = (process / "cmdline").read_bytes().decode().split("\0")[:-1]
+        executable = os.readlink(process / "exe")
+        tids = sorted(int(entry.name) for entry in (process / "task").iterdir())
+        observation.update(
+            starttime_ticks=int(identity), argv=argv, exe=executable,
+            cpus=sorted(os.sched_getaffinity(pid)),
+            threads=[{"tid": tid, "cpus": sorted(os.sched_getaffinity(tid))} for tid in tids])
+        if (identity != (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
+                or argv != (process / "cmdline").read_bytes().decode().split("\0")[:-1]
+                or executable != os.readlink(process / "exe")
+                or tids != sorted(int(entry.name) for entry in (process / "task").iterdir())):
+            observation["error"] = "process identity/exec/thread set changed during snapshot"
+    except (OSError, ValueError, IndexError, UnicodeError) as error:
+        observation["error"] = f"{type(error).__name__}: {error}"
+    observation["end_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    return observation
+
+
 def process_group_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
@@ -205,14 +229,7 @@ def run_logged_process(
                 affinity_samples = []
                 if capture_affinity:
                     for child in children:
-                        try:
-                            affinity_samples.append({
-                                "pid": child,
-                                "argv": Path(f"/proc/{child}/cmdline").read_bytes().decode().split("\0")[:-1],
-                                "cpus": sorted(os.sched_getaffinity(child)),
-                            })
-                        except (ProcessLookupError, FileNotFoundError):
-                            continue
+                        affinity_samples.append(affinity_snapshot(child))
                 samples.write(json.dumps({
                     "epoch_ns": time.time_ns(),
                     "parent_pid": process.pid,

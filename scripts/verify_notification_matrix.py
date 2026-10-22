@@ -278,6 +278,53 @@ def verify_run(directory: Path, case: dict, cpu_a: int, cpu_b: int,
             "workers": {"producer": published, "consumer": consumed}}
 
 
+def verify_runner_affinity(samples: list[dict], worker: dict, cpu: int, argv: list[str],
+                           *, schema: int, minimum_threads: int = 1) -> dict:
+    require(type(schema) is int and schema in (1, 2), "unsupported affinity sample schema")
+    observations = [affinity for sample in samples for affinity in sample.get("affinities", [])
+                    if affinity["pid"] == worker["pid"]]
+    if schema == 1:
+        require(all("schema" not in item for item in observations),
+                "runner /proc missing affinity sample schema declaration")
+        require(observations and all(item["cpus"] == [cpu] for item in observations),
+                "runner /proc process affinity mismatch")
+        return {"schema": 1, "lifecycle_observations": len(observations)}
+    counts = dict(schema=2, startup=0, work=0, teardown=0, boundary=0)
+    identity = None
+    for item in observations:
+        require(item.get("schema") == 2, "runner /proc affinity sample schema mismatch")
+        begin, end = item["begin_ns"], item["end_ns"]
+        require(type(begin) is int and type(end) is int and 0 < begin <= end,
+                "runner /proc invalid affinity sample interval")
+        if end < worker["begin_ns"]:
+            counts["startup"] += 1
+            continue
+        if begin > worker["end_ns"]:
+            counts["teardown"] += 1
+            continue
+        if begin < worker["begin_ns"] or end > worker["end_ns"]:
+            counts["boundary"] += 1
+            continue
+        require(not item.get("error"), "runner /proc work affinity unverifiable: " + str(item.get("error")))
+        require(item["argv"] == argv[3:] and item["exe"] == str(Path(argv[3]).resolve()),
+                "runner /proc worker executable/argv mismatch")
+        require(type(item["starttime_ticks"]) is int and item["starttime_ticks"] > 0,
+                "runner /proc missing process identity")
+        if identity is None:
+            identity = item["starttime_ticks"]
+        require(identity == item["starttime_ticks"], "runner /proc process identity changed")
+        require(item["cpus"] == [cpu], "runner /proc work process affinity mismatch")
+        threads = item["threads"]
+        tids = [thread["tid"] for thread in threads]
+        require(len(tids) >= minimum_threads and len(tids) == len(set(tids))
+                and worker["pid"] in tids, "runner /proc work thread set incomplete")
+        require(all(thread["cpus"] == [cpu] for thread in threads),
+                "runner /proc work thread affinity mismatch")
+        counts["work"] += 1
+    require(counts["work"] > 0, "runner /proc no verifiable in-work affinity observation")
+    return counts
+
+
 def verify(root: Path, *, allow_smoke: bool = False,
            expected_backends: tuple[str, ...] | None = None) -> dict:
     plan, manifest = load(root / "plan.json"), load(root / "manifest.json")
@@ -341,12 +388,13 @@ def verify(root: Path, *, allow_smoke: bool = False,
                     "driver source identity mismatch")
             samples = [json.loads(line) for line in (directory / "process-samples.jsonl").read_text().splitlines()]
             require(samples and samples[-1]["returncode"] == exit_record["returncode"], "process log exit mismatch")
+            worker_argv = load(directory / "output" / case["run_id"] / "workers.argv.json")
+            result["runner_affinity"] = {}
             for role, worker in result["workers"].items():
                 cpu = plan["cpu_a"] if role == "producer" or case["placement"] == "same" else plan["cpu_b"]
-                observations = [affinity for sample in samples for affinity in sample.get("affinities", [])
-                                if affinity["pid"] == worker["pid"]]
-                require(observations and all(item["cpus"] == [cpu] for item in observations),
-                        "runner /proc process affinity mismatch")
+                result["runner_affinity"][role] = verify_runner_affinity(
+                    samples, worker, cpu, worker_argv[role], schema=manifest.get("affinity_sample_schema", 1),
+                    minimum_threads=2 if role == "producer" and case["notification"] in ("eventfd", "driver") else 1)
                 require(worker["pid"] in exit_record["observed_child_pids"], "unobserved worker PID")
                 require(exit_record["start_epoch_ns"] <= worker["begin_realtime_ns"]
                         <= worker["end_realtime_ns"] <= exit_record["end_epoch_ns"], "work outside runner lifecycle")

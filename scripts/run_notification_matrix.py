@@ -177,6 +177,7 @@ def main() -> int:
                 "status": git_output(source, "status", "--porcelain=v1"),
                 "source_files": source_hashes(source),
                 "allowed_cpus": sorted(os.sched_getaffinity(0)), "environment": "VM_ONLY",
+                "affinity_sample_schema": 2,
                 "binaries": {str(binary): digest(binary) for binary in required},
                 "cache_path": str(cache), "cache_sha256": digest(cache),
                 "uname": list(os.uname()), "window_contract": rules["window"]}

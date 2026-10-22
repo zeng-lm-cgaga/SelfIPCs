@@ -18,12 +18,15 @@ import csv
 import json
 import os
 from pathlib import Path
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
+import pressure_process
 import run_notification_matrix as runner
 import verify_notification_matrix as verifier
 
@@ -300,13 +303,127 @@ class NotificationVerifierTests(unittest.TestCase):
         self.assertEqual(result["torn"], 1)
 
 
+class RunnerAffinityTests(unittest.TestCase):
+    def setUp(self):
+        self.worker = dict(pid=100, begin_ns=1000, end_ns=2000)
+        self.argv = ["taskset", "-c", "0", "/fixture/producer", "--notification", "eventfd"]
+        self.observation = dict(schema=2, pid=100, begin_ns=1200, end_ns=1300,
+                                starttime_ticks=10, argv=self.argv[3:], exe=self.argv[3],
+                                cpus=[0], threads=[dict(tid=100, cpus=[0]), dict(tid=101, cpus=[0])])
+
+    def verify(self, observations, *, schema=2):
+        return verifier.verify_runner_affinity([dict(affinities=observations)], self.worker, 0,
+                                               self.argv, schema=schema, minimum_threads=2)
+
+    def test_startup_teardown_and_boundary_are_not_work(self):
+        startup = dict(self.observation, begin_ns=500, end_ns=600, cpus=[0, 1], argv=["taskset"])
+        teardown = dict(self.observation, begin_ns=2100, end_ns=2200, error="process exited")
+        boundary = dict(self.observation, begin_ns=900, end_ns=1100, cpus=[0, 1])
+        self.assertEqual(self.verify([startup, self.observation, teardown, boundary]),
+                         dict(schema=2, startup=1, work=1, teardown=1, boundary=1))
+        legacy = [{key: value for key, value in item.items() if key != "schema"}
+                  for item in (startup, self.observation)]
+        with self.assertRaisesRegex(ValueError, "runner /proc process affinity mismatch"):
+            self.verify(legacy, schema=1)
+
+    def test_new_samples_cannot_omit_schema_declaration(self):
+        with self.assertRaisesRegex(ValueError, "missing affinity sample schema declaration"):
+            self.verify([self.observation], schema=1)
+
+    def test_missing_or_boundary_only_work_is_unverifiable(self):
+        for observations in ([], [dict(self.observation, pid=999)],
+                             [dict(self.observation, begin_ns=900, end_ns=1100)],
+                             [dict(self.observation, begin_ns=1900, end_ns=2100)]):
+            with self.subTest(observations=observations):
+                with self.assertRaisesRegex(ValueError, "no verifiable in-work affinity observation"):
+                    self.verify(observations)
+
+    def test_real_work_process_mismatch_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "work process affinity mismatch"):
+            self.verify([self.observation, dict(self.observation, cpus=[0, 1])])
+
+    def test_real_service_thread_mismatch_or_missing_is_rejected(self):
+        changed = dict(self.observation, threads=[dict(tid=100, cpus=[0]), dict(tid=101, cpus=[1])])
+        with self.assertRaisesRegex(ValueError, "work thread affinity mismatch"):
+            self.verify([changed])
+        with self.assertRaisesRegex(ValueError, "work thread set incomplete"):
+            self.verify([dict(self.observation, threads=[dict(tid=100, cpus=[0])])])
+
+    def test_identity_exec_schema_and_unreadable_work_are_rejected(self):
+        changes = [(dict(starttime_ticks=11), "process identity changed"),
+                   (dict(exe="/fixture/other"), "worker executable/argv mismatch"),
+                   (dict(argv=["taskset"]), "worker executable/argv mismatch"),
+                   (dict(schema=1), "affinity sample schema mismatch"),
+                   (dict(error="PermissionError"), "work affinity unverifiable"),
+                   (dict(begin_ns=1400, end_ns=1300), "invalid affinity sample interval")]
+        for change, message in changes:
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.verify([self.observation, dict(self.observation, **change)])
+
+    def test_snapshot_preserves_unreadable_error_and_interval(self):
+        with mock.patch.object(pressure_process.os, "sched_getaffinity", side_effect=ProcessLookupError()):
+            observation = pressure_process.affinity_snapshot(os.getpid())
+        self.assertIn("ProcessLookupError", observation["error"])
+        self.assertLessEqual(observation["begin_ns"], observation["end_ns"])
+        self.assertEqual(observation["pid"], os.getpid())
+
+    def test_real_fork_exec_startup_and_work_gates(self):
+        cpu = min(os.sched_getaffinity(0))
+        work = '''import json, os, signal, time
+print('WORK_BEGIN ' + json.dumps(dict(pid=os.getpid(), begin_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW))), flush=True)
+os.kill(os.getpid(), signal.SIGSTOP)
+print('WORK_END ' + json.dumps(dict(end_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW))), flush=True)
+'''
+        work_argv = [sys.executable, "-c", work]
+        startup = ("import os, signal; os.kill(os.getpid(), signal.SIGSTOP); "
+                   + "os.execv('/usr/bin/taskset', " + repr(["taskset", "-c", str(cpu), *work_argv]) + ")")
+        driver = ("import subprocess; raise SystemExit(subprocess.call("
+                  + repr([sys.executable, "-c", startup]) + "))")
+        released = set()
+        snapshot = pressure_process.affinity_snapshot
+
+        def capture_and_release(pid):
+            observation = snapshot(pid)
+            stage = "work" if observation.get("argv") == work_argv else "startup"
+            if stage not in released and 'State:\tT' in Path(f"/proc/{pid}/status").read_text():
+                released.add(stage)
+                os.kill(pid, signal.SIGCONT)
+            return observation
+
+        with tempfile.TemporaryDirectory(prefix="notification-affinity-gates-") as temporary:
+            root = Path(temporary)
+            with mock.patch.object(pressure_process, "affinity_snapshot", side_effect=capture_and_release):
+                result = pressure_process.run_logged_process(
+                    [sys.executable, "-c", driver], cwd=root, env=os.environ.copy(),
+                    stdout_path=root / "stdout", stderr_path=root / "stderr",
+                    sample_path=root / "samples.jsonl", timeout_s=5, term_grace_s=1, capture_affinity=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(result.timed_out or result.orphan_group_reaped)
+            self.assertEqual(released, {"startup", "work"})
+            begin = verifier.one_record((root / "stdout").read_text(), "WORK_BEGIN")
+            end = verifier.one_record((root / "stdout").read_text(), "WORK_END")
+            worker = dict(begin, **end)
+            samples = [json.loads(line) for line in (root / "samples.jsonl").read_text().splitlines()]
+            counts = verifier.verify_runner_affinity(samples, worker, cpu, ["taskset", "-c", str(cpu), *work_argv], schema=2)
+            self.assertGreaterEqual(counts["startup"], 1)
+            self.assertGreaterEqual(counts["work"], 1)
+            if len(os.sched_getaffinity(0)) > 1:
+                legacy = [dict(sample, affinities=[{key: value for key, value in item.items() if key != "schema"}
+                                                  for item in sample.get("affinities", [])]) for sample in samples]
+                with self.assertRaisesRegex(ValueError, "runner /proc process affinity mismatch"):
+                    verifier.verify_runner_affinity(legacy, worker, cpu,
+                                                    ["taskset", "-c", str(cpu), *work_argv], schema=1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary-dir", type=Path)
     parser.add_argument("--output-root", type=Path, default=Path("/tmp"))
     args = parser.parse_args()
-    result = unittest.TextTestRunner(verbosity=2).run(
-        unittest.defaultTestLoader.loadTestsFromTestCase(NotificationVerifierTests))
+    suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(test_case)
+                               for test_case in (NotificationVerifierTests, RunnerAffinityTests))
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         return 1
     if args.binary_dir:
