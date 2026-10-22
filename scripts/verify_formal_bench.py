@@ -259,6 +259,35 @@ def check_spsc(case_dir: Path, case: dict) -> dict:
     return result
 
 
+def usable_affinity_snapshot(sample) -> bool:
+    if not isinstance(sample, dict) or "error" in sample:
+        return False
+    argv, cpus = sample.get("argv"), sample.get("cpus")
+    if (not isinstance(argv, list) or not argv or not all(isinstance(token, str) for token in argv)
+            or not argv[0] or not isinstance(cpus, list) or not cpus
+            or not all(type(cpu) is int and cpu >= 0 for cpu in cpus)):
+        return False
+    if "schema" not in sample:
+        return True
+    if type(sample["schema"]) is not int or sample["schema"] != 2:
+        return False
+    if any(type(sample.get(key)) is not int or sample[key] <= 0
+           for key in ("pid", "begin_ns", "end_ns", "starttime_ticks")):
+        return False
+    executable, threads = sample.get("exe"), sample.get("threads")
+    if (sample["begin_ns"] > sample["end_ns"] or not isinstance(executable, str)
+            or not Path(executable).is_absolute()
+            or canonical_name(Path(executable).name) != canonical_name(Path(argv[0]).name)
+            or not isinstance(threads, list) or not threads):
+        return False
+    if any(not isinstance(thread, dict) or type(thread.get("tid")) is not int
+           or thread["tid"] <= 0 or thread.get("cpus") != cpus
+           or any(type(cpu) is not int for cpu in thread["cpus"]) for thread in threads):
+        return False
+    tids = [thread["tid"] for thread in threads]
+    return sample["pid"] in tids and len(tids) == len(set(tids))
+
+
 def check_manifest(path: Path, metadata: dict) -> None:
     argv = metadata["argv"]
     source = metadata["source"]
@@ -286,13 +315,22 @@ def check_manifest(path: Path, metadata: dict) -> None:
                     "self_ipcs_shm_bench_consumer": (source["cpu_a"] if placement == "same"
                                                    else source["cpu_b"])}
         found = set()
+        unusable = 0
         for line in (path.parent / "process-samples.jsonl").read_text().splitlines():
             for sample in json.loads(line).get("affinities", []):
-                if not sample["argv"]:
+                if not usable_affinity_snapshot(sample):
+                    unusable += 1
                     continue
                 name = canonical_name(Path(sample["argv"][0]).name)
                 if name == "self_ipcs_shm_bench_sock":
+                    if sample["argv"].count("--role") != 1:
+                        unusable += 1
+                        continue
                     role_index = sample["argv"].index("--role")
+                    if (role_index + 1 >= len(sample["argv"])
+                            or sample["argv"][role_index + 1] not in ("producer", "consumer")):
+                        unusable += 1
+                        continue
                     name = ("self_ipcs_shm_bench_producer"
                             if sample["argv"][role_index + 1] == "producer"
                             else "self_ipcs_shm_bench_consumer")
@@ -300,8 +338,11 @@ def check_manifest(path: Path, metadata: dict) -> None:
                 base_name = name.removeprefix("socket_")
                 if base_name in expected and sample["cpus"] == [expected[base_name]]:
                     found.add(name)
-        if len(found) != 4:
-            raise ValueError("missing actual affinity snapshots for both transport pairs")
+        required = set(expected) | {"socket_" + name for name in expected}
+        if found != required:
+            raise ValueError("missing actual affinity snapshots for both transport pairs: "
+                             + ", ".join(sorted(required - found))
+                             + f"; unusable snapshots={unusable}")
     else:
         configured = {"--producers": case["producers"], "--consumers": case["consumers"],
                       "--messages": case["messages"], "--capacity": case.get("capacity", 64), "--runs": 1}

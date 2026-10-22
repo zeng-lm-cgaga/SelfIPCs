@@ -12,11 +12,12 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from pressure_process import run_logged_process
+from pressure_process import affinity_snapshot, run_logged_process
 from release_audit import (AuditFailure, assert_downstream_sources, assert_install,
                            assert_release_configuration)
 from run_formal_bench import cases, digest, invocation, main as runner_main, message_budget
@@ -145,6 +146,111 @@ class FormalBenchTest(unittest.TestCase):
                             samples.write_text(json.dumps(observed) + "\n")
                             with self.assertRaisesRegex(ValueError, "affinity snapshots"):
                                 check_manifest(command, metadata)
+
+    def schema2_affinity_samples(self, command):
+        samples = json.loads((command.parent / "process-samples.jsonl").read_text())["affinities"]
+        for pid, sample in enumerate(samples, 100):
+            sample.update(schema=2, pid=pid, begin_ns=1000, end_ns=1100, starttime_ticks=10,
+                          exe=str(Path(sample["argv"][0]).resolve()),
+                          threads=[dict(tid=pid, cpus=list(sample["cpus"]))])
+        return samples
+
+    def test_manifest_retains_real_reaped_child_errors_with_all_four_roles(self):
+        child = subprocess.Popen(["/bin/true"])
+        self.assertEqual(child.wait(timeout=5), 0)
+        self.assertFalse(Path(f"/proc/{child.pid}").exists(), "PID reused; do not guess")
+        error = affinity_snapshot(child.pid)
+        self.assertIn("error", error)
+        self.assertNotIn("argv", error)
+        self.assertNotIn("cpus", error)
+        for legacy in (False, True):
+            for placement in ("same", "different"):
+                for schema in (1, 2):
+                    with self.subTest(legacy=legacy, placement=placement, schema=schema):
+                        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+                            command, metadata = self.make_manifest(Path(directory), "spsc", legacy, placement)
+                            path = command.parent / "process-samples.jsonl"
+                            if schema == 2:
+                                path.write_text(json.dumps(dict(affinities=self.schema2_affinity_samples(command))) + "\n")
+                            with path.open("a") as stream:
+                                stream.write(json.dumps(dict(affinities=[error])) + "\n")
+                            original = path.read_bytes()
+                            check_manifest(command, metadata)
+                            self.assertEqual(path.read_bytes(), original)
+
+    def test_manifest_ignores_incomplete_extra_samples_without_counting_them(self):
+        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+            command, metadata = self.make_manifest(Path(directory), "spsc", False)
+            path = command.parent / "process-samples.jsonl"
+            valid = self.schema2_affinity_samples(command)
+            invalid = [None, {}, dict(error="exited"), dict(schema=2),
+                       dict(schema=2, argv=valid[0]["argv"]), dict(argv=123, cpus=[2]),
+                       dict(argv=["self_ipcs_shm_bench_sock", "--role"], cpus=[2]),
+                       dict(argv=["self_ipcs_shm_bench_sock", "--role", "unknown"], cpus=[2])]
+            path.write_text(json.dumps(dict(affinities=valid + invalid)) + "\n")
+            original = path.read_bytes()
+            check_manifest(command, metadata)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_manifest_requires_each_transport_role_despite_partial_or_error_records(self):
+        for legacy in (False, True):
+            for placement in ("same", "different"):
+                with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+                    command, metadata = self.make_manifest(Path(directory), "spsc", legacy, placement)
+                    path = command.parent / "process-samples.jsonl"
+                    valid = self.schema2_affinity_samples(command)
+                    for ordinal, sample in enumerate(valid):
+                        for replacement in (None, dict(sample, error="process exited"),
+                                            dict(schema=2, argv=sample["argv"], cpus=sample["cpus"]),
+                                            dict(sample, cpus=[999999])):
+                            with self.subTest(legacy=legacy, placement=placement, role=ordinal,
+                                              replacement=replacement):
+                                changed = copy.deepcopy(valid)
+                                changed[ordinal] = replacement
+                                path.write_text(json.dumps(dict(affinities=changed)) + "\n")
+                                with self.assertRaisesRegex(ValueError, "missing actual affinity snapshots.*unusable snapshots="):
+                                    check_manifest(command, metadata)
+                    path.write_text(json.dumps(dict(affinities=[dict(sample, error="unreadable") for sample in valid])) + "\n")
+                    with self.assertRaisesRegex(ValueError, "missing actual affinity snapshots"):
+                        check_manifest(command, metadata)
+
+    def test_manifest_schema2_missing_fields_do_not_become_affinity_evidence(self):
+        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+            command, metadata = self.make_manifest(Path(directory), "spsc", False, "different")
+            path = command.parent / "process-samples.jsonl"
+            valid = self.schema2_affinity_samples(command)
+            for field in ("argv", "cpus", "pid", "begin_ns", "end_ns", "starttime_ticks", "exe", "threads"):
+                with self.subTest(field=field):
+                    changed = copy.deepcopy(valid)
+                    del changed[0][field]
+                    path.write_text(json.dumps(dict(affinities=changed)) + "\n")
+                    with self.assertRaisesRegex(ValueError, "missing actual affinity snapshots"):
+                        check_manifest(command, metadata)
+
+    def test_manifest_schema2_invalid_identity_threads_and_socket_role_are_rejected(self):
+        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+            command, metadata = self.make_manifest(Path(directory), "spsc", True, "different")
+            path = command.parent / "process-samples.jsonl"
+            valid = self.schema2_affinity_samples(command)
+            invalid = [dict(schema=3), dict(schema=True), dict(pid=0), dict(starttime_ticks=True),
+                       dict(begin_ns=1200), dict(exe="relative/path"), dict(exe="/another/binary"),
+                       dict(threads=[]), dict(threads=[dict(tid=100, cpus=[3])]),
+                       dict(threads=[dict(tid=101, cpus=[2])]),
+                       dict(threads=[dict(tid=100, cpus=[2]), dict(tid=100, cpus=[2])])]
+            for change in invalid:
+                with self.subTest(change=change):
+                    changed = copy.deepcopy(valid)
+                    changed[0].update(change)
+                    path.write_text(json.dumps(dict(affinities=changed)) + "\n")
+                    with self.assertRaisesRegex(ValueError, "missing actual affinity snapshots"):
+                        check_manifest(command, metadata)
+            for argv in (["self_ipcs_shm_bench_sock", "--role"],
+                         ["self_ipcs_shm_bench_sock", "--role", "unknown"]):
+                changed = copy.deepcopy(valid)
+                changed[-1] = dict(argv=argv, cpus=[3])
+                path.write_text(json.dumps(dict(affinities=changed)) + "\n")
+                with self.assertRaisesRegex(ValueError, "socket_self_ipcs_shm_bench_consumer"):
+                    check_manifest(command, metadata)
 
     def test_installed_package_and_default_consumer_use_self_ipcs_archive(self):
         with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
