@@ -438,6 +438,11 @@ cmake -S /path/to/your/app -B build \
 
 2026-10-14 SelfIPCs 验证：全新 Debug 构建完成 **217/217** 项启用测试，ASan/UBSan 的工具、CLI、配置兼容及负例检查 **47/47**。Release 和 sanitizer 安装包均完成新入口、旧入口及两种包查找顺序的独立消费；双向新旧进程组合通过 channel、queue+wait 和 Pool 描述符链。公共 qualified `PayloadCodec` 特化、15 组新旧工具入口及默认子进程路径同步验证。
 
+2026-10-22 Linux 虚拟机补充验证：`SharedBufferPoolIntegration.*` 的 **12 项真实跨进程用例**
+在 Debug 和 ASan/UBSan 各完成 **12/12**，覆盖描述符链、角色切换、ABI/schema 拒绝、死亡持有者、
+owner 提交窗口、epoch 边界及过期 reader。ASan/UBSan 使用 `detect_leaks=0`；失败/死亡持有者对象
+保留只读身份与快照，健康对象按 SDK 所有权规则清理。可选 SDK CI 显式选择这 12 项用例。
+
 ### 2026-10-13 跨进程 benchmark
 
 以下为 **2026-10-13 Linux虚拟机实测**，自研工具通过真实 `fork/exec` 执行，历史采集版本为改名前的 `ec96119`。环境为 **VMware 8 vCPU、Ubuntu 22.04.5、Linux 6.8、GCC 11.4、CMake 3.22.1（`VM_ONLY`）**，Release `-O3 -DNDEBUG`，sanitizer/failpoint 均为 OFF。MPMC/Pool 使用 CPU 0–7 的默认亲和性；SPSC 对照固定 CPU 0 或 CPU 0/1。采集早期的同机 ROS2 构建活动随环境日志记录。

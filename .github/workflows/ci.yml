@@ -79,7 +79,7 @@ jobs:
             cmake --build "$out/$mode" -j2
             ctest --test-dir "$out/$mode" --output-on-failure \
               --output-junit "$out/$mode.junit.xml" \
-              -R 'AsyncClose\.|PoolMappingLifetime\.|PoolQueueTest\.|PoolLivenessRace\.|PoolWaitFeatureTest\.|SharedBufferPoolLayout\.|QueueFeatures\.|async_consume_demo|notification_service_configuration'
+              -R 'AsyncClose\.|PoolMappingLifetime\.|PoolQueueTest\.|PoolLivenessRace\.|PoolWaitFeatureTest\.|SharedBufferPoolLayout\.|SharedBufferPoolIntegration\.|QueueFeatures\.|async_consume_demo|notification_service_configuration'
           done
           cmake -S . -B "$out/release" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
             -DSELFIPCS_BUILD_ASYNC=ON -DSELFIPCS_ENABLE_FAILPOINTS=OFF \
