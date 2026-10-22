@@ -185,6 +185,15 @@ cmake --build /tmp/selfipcs-async-demo
 `examples/async_consume_demo/` 以真实 `fork/exec` producer 演示两个独立通道共用一个事件循环，
 并展示 timeout、cancel、重新等待和 close。增加 `SELFIPCS_DEMO_USE_LEGACY=ON` 可组合旧核心包入口。
 
+安装后可通过下列入口复制示例、重定位 SDK，并串行编译运行基础 C++17、Queue/Pool、通知及
+可选协程的新旧消费入口；消费工程只链接复制后的安装包：
+
+```bash
+python3 -B scripts/check_optional_sdk.py --prefix /your/async-prefix \
+  --output-root /absolute/existing/evidence-directory --with-async
+# 对应 ASan/UBSan 安装包增加 --sanitizers，沿用 detect_leaks=0。
+```
+
 ### Linux 混合 I/O 与软件通知实验
 
 `examples/mixed_io_demo/` 将 SPSC 聚合通知 FD、SocketCAN、timerfd 和停止 eventfd 放在同一个
@@ -259,7 +268,41 @@ python3 scripts/prepare_notification_service.py --user selfipcs-demo \
 默认选择 futex/eventfd；增加 `--backends futex,eventfd,driver` 生成三后端 36 轮配置，
 验证器使用同一显式选择检查范围，并独立核验规范配置与 raw 中的实际后端。
 显式请求 driver 时，设备缺失以具体错误保留为失败轮次。
-保存 raw worker、CSV、工作区间及完整进程生命周期 CPU。正式采集与完整场景/竞态验收在功能集成后统一执行。
+保存 raw worker、CSV、工作区间及完整进程生命周期 CPU。CPU 百分比按各进程工作区间的
+user+system CPU / 实际墙钟时间计算；生产进程包含通知控制线程。
+
+2026-10-22 Linux 虚拟机实测（采集提交 `7063a03`）：Ubuntu 22.04、Linux 6.8、GCC 11.4，
+8 vCPU VMware，Release `-O3 -DNDEBUG`、sanitizer/failpoint OFF。64B、1P1C、每轮发布1000条、
+预热100个观察样本，100/1000Hz × 同/跨 vCPU × futex/eventfd × 3轮，共24轮串行采集。
+独立验证确认24轮发布/观察账本及数据完整性；16轮满足零跳样、900个测量样本及零跨发布排队的
+延迟比较条件。1000Hz下8轮出现 latest-value 合法序号跳跃，按观察计数保留原始记录。
+
+下表为100Hz全部合格配对的三轮 median [min–max]，计时为同机
+`CLOCK_MONOTONIC_RAW` 的 publish→observation，预热后 nearest-rank 分位数：
+
+| vCPU / 通知 | p50（µs） | p99（µs） |
+|---|---:|---:|
+| 0 / futex | 14.290 [13.787–14.325] | 50.050 [43.117–94.486] |
+| 0 / eventfd | 50.869 [48.419–53.555] | 117.062 [115.263–124.456] |
+| 0→1 / futex | 44.668 [43.510–48.016] | 121.060 [109.982–137.944] |
+| 0→1 / eventfd | 80.104 [77.719–80.941] | 182.743 [173.776–196.446] |
+
+本批同条件下 futex 的延迟和 CPU 更低；FD 通知提供接入 epoll/Asio 统一事件循环的能力。
+同批真实 vcan 使用专属临时 user/network namespace：正常/256帧突发、每组2秒、新旧安装
+入口各两组，Release 4组及 ASan/UBSan 4组完成，记录各事件计数、最大处理间隔和停止时延。
+另一次502.1ms业务空闲窗口中，timerfd继续运行，consumer占用0.608ms进程CPU（0.121%），
+consumer为1线程、producer含控制服务共2线程。CPU通过同UID进程的POSIX CPU clock读取。
+持续可读饱和、stop多源同时就绪和混合循环内producer退出场景继续按独立用例验收；驱动实测
+及调试内核验证随设备与权限准备后进行。
+
+```bash
+python3 -B scripts/run_notification_matrix.py --binary-dir build/selfipcs-release/tools \
+  --git-dir "$PWD" --output-root /absolute/existing/evidence-directory \
+  --cpu-a 0 --cpu-b 1 --backends futex,eventfd
+python3 -B scripts/verify_notification_matrix.py \
+  --input-root /absolute/path/to/notification-formal-RUN \
+  --output /absolute/path/to/new-verification.json
+```
 
 ### 队列关闭、批量与 Pool 等待
 
@@ -324,7 +367,8 @@ publish/enqueue 之间生产者退出、pop/acquire_read 之间消费者退出�
 和 `batch_calls` 按外层调用计数，`waits` 为实际 futex 调用，Full/Empty/contention 为尝试结果，
 timeouts/cancelled 为等待退出或批量取消，notifications 为本句柄发布的队列/Pool 唤醒提示。
 capacity 是实例固定容量；并发在用量按原 status 观察，快照字段是分时观察值。
-统计 off/on 开销与单条/批量性能对照在集中验收阶段按相同配置采集。
+单条/批量及统计 off/on 对照固定 payload、容量、进程数、总消息量和亲和性，分别报告
+worker 工作区间与父进程端到端吞吐、CPU、等待/竞争计数和预热后延迟。
 
 独立 C++17 示例通过真实 fork/exec 与独立 open 演示容量等待、取消、批量前缀、关闭排空和 Pool
 归还唤醒，并打印每个句柄的计数：
