@@ -102,8 +102,9 @@ class CiWorkflowTests(unittest.TestCase):
             with self.subTest(full=full):
                 self.assertTrue(full_enabled(self.condition, "schedule", "refs/heads/main", full))
 
-    def test_full_flag_reaches_both_release_audit_runners(self):
-        self.assertIn("        os: [ubuntu-22.04, ubuntu-24.04]\n", self.audit)
+    def test_full_flag_reaches_supported_release_audit_runner(self):
+        self.assertIn("        os: [ubuntu-22.04]\n", self.audit)
+        self.assertNotIn("ubuntu-24.04", self.workflow)
         self.assertIn("    runs-on: ${{ matrix.os }}\n", self.audit)
         self.assertIn('if [[ "$SELFIPCS_FULL" == true ]]; then args+=(--full); fi', self.audit)
         self.assertIn('bash scripts/ci.sh "${args[@]}"', self.audit)
