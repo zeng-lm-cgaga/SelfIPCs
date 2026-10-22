@@ -22,6 +22,7 @@
 #include "edge_runtime/sync/shared_atomic.hpp"
 #include "edge_runtime/transport/fd_broker.hpp"
 #include "test_payload.hpp"
+#include "retained_shm.hpp"
 
 namespace {
 
@@ -201,7 +202,7 @@ int posix_image(const std::string& name, uint32_t boot_state, uint32_t header_st
 			}
 		}
 	}
-	return shm_unlink_checked(channel_shm_name(name), dev, ino) && initialized ? 0 : 4;
+	return edge_test::retain_shm_object(channel_shm_name(name)) && initialized ? 0 : 4;
 }
 
 bool send_reply(int socket, FdBrokerReplyAbi reply, int payload, size_t descriptors, size_t bytes) {

@@ -19,6 +19,7 @@
 #include "edge_runtime/channel/producer.hpp"
 #include "test_payload.hpp"
 #include "test_util.hpp"
+#include "retained_shm.hpp"
 
 namespace {
 
@@ -80,22 +81,8 @@ bool contains(const std::string& text, const char* needle) {
 	return text.find(needle) != std::string::npos;
 }
 
-void reset_journal_idle(const std::string& channel_name) {
-	auto lock = detail::ControlLock::acquire(detail::channel_lock_path(channel_name));
-	ASSERT_TRUE(lock) << edge_runtime::to_string(lock.error().code);
-	auto idle = detail::make_control_journal(channel_name, detail::JournalState::kIdle, 0, 0, 0,
-	                                         0, 0, 0, detail::current_process_identity());
-	ASSERT_TRUE(lock.value().write_journal(idle));
-}
-
-void unlink_shm(const std::string& channel_name) {
-	const std::string shm = detail::channel_shm_name(channel_name);
-	auto fd = detail::shm_open_existing(shm);
-	if (!fd) return;
-	uint64_t dev = 0, ino = 0;
-	auto fst = detail::shm_fstat_and_capture(fd.value(), &dev, &ino, nullptr);
-	if (!fst) return;
-	(void)detail::shm_unlink_checked(shm, dev, ino);
+void retain_shm(const std::string& channel_name) {
+	EXPECT_TRUE(edge_test::retain_shm_object(detail::channel_shm_name(channel_name)));
 }
 
 TEST(Recovery, PreObjectNarrowAutoClean) {
@@ -140,8 +127,7 @@ TEST(Recovery, PreObjectNonEmptyBlocks) {
 	ASSERT_FALSE(p) << "recovery must not unlink a non-empty pre-object";
 	EXPECT_EQ(p.error().code, ErrorCode::kRecoveryBlocked);
 
-	ASSERT_TRUE(detail::shm_unlink_checked(shm, dev, ino));
-	reset_journal_idle(name);
+	ASSERT_TRUE(edge_test::retain_shm_object(shm));
 }
 
 TEST(Recovery, PartialObjectAutoRecovers) {
@@ -180,6 +166,7 @@ TEST(Recovery, ABANameReuseBlocks) {
 	uint64_t dev0 = 0, ino0 = 0;
 	ASSERT_TRUE(detail::shm_fstat_and_capture(fd0.value(), &dev0, &ino0, nullptr));
 
+	ASSERT_TRUE(edge_test::preserve_aba_creator(shm));
 	ASSERT_TRUE(detail::shm_unlink_checked(shm, dev0, ino0));
 	auto fd1 = detail::shm_open_create(shm);
 	ASSERT_TRUE(fd1);
@@ -192,8 +179,7 @@ TEST(Recovery, ABANameReuseBlocks) {
 	ASSERT_FALSE(p) << "recovery must not touch an object the journal does not own";
 	EXPECT_EQ(p.error().code, ErrorCode::kNameRaceDetected);
 
-	ASSERT_TRUE(detail::shm_unlink_checked(shm, dev1, ino1));
-	reset_journal_idle(name);
+	ASSERT_TRUE(edge_test::retain_shm_object(shm));
 }
 
 TEST(Recovery, GenerationDisagreementBlocks) {
@@ -271,7 +257,7 @@ TEST(Recovery, DeadProducerReplacementIncrementsGeneration) {
 	EXPECT_EQ(snap.value().generation, 2u);
 	EXPECT_GT(snap.value().sequence, 0u);
 
-	unlink_shm(name);
+	retain_shm(name);
 }
 
 TEST(Recovery, DeadConsumerSlotReclaim) {
@@ -300,7 +286,7 @@ TEST(Recovery, DeadConsumerSlotReclaim) {
 	        << "producer wedged on a leaked READING slot: " << out_prod;
 	EXPECT_FALSE(contains(out_prod, "PUBLISH_FAIL")) << out_prod;
 
-	unlink_shm(name);
+	retain_shm(name);
 }
 
 }

@@ -28,6 +28,7 @@
 #include "edge_runtime/queue/mpmc_queue.hpp"
 #include "edge_runtime/sync/futex.hpp"
 #include "edge_runtime/sync/shared_atomic.hpp"
+#include "retained_shm.hpp"
 #include "edge_runtime/transport/shm_object.hpp"
 #include "edge_runtime/common/error.hpp"
 #include "mpmc_payload.hpp"
@@ -237,7 +238,7 @@ class ScopedMpmcShm {
 	public:
 	explicit ScopedMpmcShm(const std::string& name) : name_(name) {}
 	~ScopedMpmcShm() {
-		(void)::shm_unlink(edge_runtime::detail::mpmc_shm_name(name_).c_str());
+		EXPECT_TRUE(edge_test::retain_shm_object(edge_runtime::detail::mpmc_shm_name(name_)));
 	}
 
 	private:

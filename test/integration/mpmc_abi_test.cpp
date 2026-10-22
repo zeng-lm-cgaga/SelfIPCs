@@ -10,6 +10,7 @@
 #include "edge_runtime/queue/mpmc_queue.hpp"
 #include "edge_runtime/queue/mpmc_layout.hpp"
 #include "mpmc_payload.hpp"
+#include "retained_shm.hpp"
 #include "test_util.hpp"
 
 namespace {
@@ -52,7 +53,7 @@ TEST(MpmcAbi, V2BinaryRejectsLegacyMappingBeforeEpochRead) {
 	const auto opened = Queue::open(options_for(name, 2), MpmcTestSchema());
 	ASSERT_FALSE(opened);
 	EXPECT_EQ(opened.error().code, ErrorCode::kAbiMismatch);
-	EXPECT_EQ(::shm_unlink(edge_runtime::detail::mpmc_shm_name(name).c_str()), 0);
+	EXPECT_TRUE(edge_test::retain_shm_object(edge_runtime::detail::mpmc_shm_name(name)));
 }
 
 }  // namespace

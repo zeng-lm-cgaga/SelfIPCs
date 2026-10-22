@@ -21,6 +21,7 @@
 #include "edge_runtime/sync/shared_atomic.hpp"
 #include "edge_runtime/transport/shm_object.hpp"
 #include "mpmc_payload.hpp"
+#include "retained_shm.hpp"
 #include "test_util.hpp"
 
 namespace {
@@ -184,7 +185,7 @@ struct ShmCleanup {
 	explicit ShmCleanup(std::string queue_name) : name(std::move(queue_name)) {}
 	~ShmCleanup() {
 		const std::string shm_name = edge_runtime::detail::mpmc_shm_name(name);
-		(void)::shm_unlink(shm_name.c_str());
+		EXPECT_TRUE(edge_test::retain_shm_object(shm_name));
 	}
 
 	std::string name;
@@ -656,7 +657,6 @@ TEST(MpmcOwnerSnapshot, EpochExhaustionDoesNotWrapOrDestroyPublishedPayload) {
 		const auto before = queue.value().try_push(MpmcTestPayload{1, 1, 0x4D504D43u});
 		ASSERT_FALSE(before);
 		EXPECT_EQ(before.error().code, ErrorCode::kRecoveryBlocked);
-		EXPECT_EQ(::shm_unlink(edge_runtime::detail::mpmc_shm_name(name).c_str()), 0);
 	}
 
 	{

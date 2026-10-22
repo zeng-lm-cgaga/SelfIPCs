@@ -138,7 +138,8 @@ auto notification = consumer.event_notification(self_ipcs::NotificationBackend::
 
 安装后的 `notification_demo --backend driver` 及 `async_consume_demo --backend driver`
 提供真实 fork/exec、独立打开通道和生命周期演示；默认参数使用 eventfd。
-2026-10-22 已完成 SDK/模块编译及设备缺失拒绝路径检查，驱动运行演示随模块加载后验收。
+2026-10-22 已在 Linux VM 实测驱动通知、独立进程与安装包消费、普通账号和 systemd 服务，
+并验证设备缺失/权限拒绝、争用及正常卸载；测试后的临时设备授权已恢复。调试内核检查另行验收。
 
 ### 可选 C++20 协程消费
 
@@ -449,6 +450,10 @@ cmake -S /path/to/your/app -B build \
 在 Debug 和 ASan/UBSan 各完成 **12/12**，覆盖描述符链、角色切换、ABI/schema 拒绝、死亡持有者、
 owner 提交窗口、epoch 边界及过期 reader。ASan/UBSan 使用 `detect_leaks=0`；失败/死亡持有者对象
 保留只读身份与快照，健康对象按 SDK 所有权规则清理。可选 SDK CI 显式选择这 12 项用例。
+
+同日最终候选的 314 项启用测试按身份逐项归并：Debug、ASan/UBSan 各补验 **217 项**、
+复用未改实现对应的 **97 项**记录（含各 8 项真实驱动测试）。默认禁用的完整崩溃矩阵另行
+显式执行，Debug 与 ASan/UBSan 均为 **C01–C23：23/23**；故障对象、原 inode 和只读快照保留。
 
 ### 2026-10-13 跨进程 benchmark
 

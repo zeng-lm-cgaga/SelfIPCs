@@ -78,6 +78,15 @@ selfipcs_tool(edge_benchmark_watchdog_helper self_ipcs_benchmark_watchdog_helper
 if(BUILD_TESTING)
   find_package(Python3 QUIET COMPONENTS Interpreter)
 
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME crash_matrix_evidence_retention
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_crash_evidence.py
+              --matrix $<TARGET_FILE:edge_crash_matrix>
+              --output-root ${CMAKE_BINARY_DIR}/metadata/tools/retention)
+    set_tests_properties(crash_matrix_evidence_retention PROPERTIES TIMEOUT 60 LABELS crash)
+  endif()
+
   add_test(NAME platform_contract COMMAND edge_runtime_platform_probe)
   set_tests_properties(platform_contract PROPERTIES TIMEOUT 10)
 

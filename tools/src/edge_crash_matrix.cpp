@@ -240,12 +240,12 @@ class CaseDriver {
 
 	bool ok() const { return pass_; }
 
-	void write_evidence(const std::string& rel, const std::string& content) {
+	bool write_evidence(const std::string& rel, const std::string& content) {
 		const std::string path = case_dir_ + "/" + rel;
 		std::FILE* f = std::fopen(path.c_str(), "w");
-		if (f == nullptr) return;
-		std::fwrite(content.data(), 1, content.size(), f);
-		std::fclose(f);
+		if (f == nullptr) return false;
+		const bool written = std::fwrite(content.data(), 1, content.size(), f) == content.size();
+		return std::fclose(f) == 0 && written;
 	}
 
 	void fail(const std::string& reason) {
@@ -342,12 +342,28 @@ std::string gen_pids_line(const char* case_id, const CrashChild& c) {
 	return buf;
 }
 
-void reset_journal_idle(const std::string& channel_name) {
-	auto lock = detail::ControlLock::acquire(detail::channel_lock_path(channel_name));
-	if (!lock) return;
-	auto idle = detail::make_control_journal(channel_name, detail::JournalState::kIdle, 0, 0, 0,
-	                                         0, 0, 0, detail::current_process_identity());
-	(void)lock.value().write_journal(idle);
+bool snapshot_object(CaseDriver& driver, const std::string& shm, const std::string& tag) {
+	auto descriptor = detail::shm_open_existing(shm);
+	if (!descriptor) return false;
+	uint64_t device = 0, inode = 0, size = 0;
+	if (!detail::shm_fstat_and_capture(descriptor.value(), &device, &inode, &size) ||
+	    size > 1024 * 1024) {
+		return false;
+	}
+	std::string bytes(static_cast<size_t>(size), '\0');
+	size_t copied = 0;
+	while (copied < bytes.size()) {
+		const ssize_t count = ::pread(descriptor.value().get(), bytes.data() + copied,
+		                              bytes.size() - copied, static_cast<off_t>(copied));
+		if (count < 0 && errno == EINTR) continue;
+		if (count <= 0) return false;
+		copied += static_cast<size_t>(count);
+	}
+	const std::string identity = "name=" + shm + "\ndev=" + std::to_string(device) +
+	                             "\nino=" + std::to_string(inode) +
+	                             "\nsize=" + std::to_string(size) + "\n";
+	return driver.write_evidence(tag + ".bin", bytes) &&
+	       driver.write_evidence(tag + ".txt", identity);
 }
 
 struct HeaderView {
@@ -721,7 +737,6 @@ static bool run_c12(CaseDriver& d) {
 		auto p2 = Producer<TestPayloadV1>::create(opts, schema);
 		if (p2) {
 			d.fail("C12 create must fail closed on an unstable identity");
-			(void)p2.value().remove_if_owner();
 		} else {
 			const std::string code = to_string(p2.error().code);
 			ev += "create blocked code=" + code + " ctx=" + p2.error().context + "\n";
@@ -731,16 +746,8 @@ static bool run_c12(CaseDriver& d) {
 		}
 	}
 
-	{
-		const std::string shm = detail::channel_shm_name(name);
-		auto fd = detail::shm_open_existing(shm);
-		if (fd) {
-			uint64_t dev = 0, ino = 0;
-			if (detail::shm_fstat_and_capture(fd.value(), &dev, &ino, nullptr)) {
-				(void)detail::shm_unlink_checked(shm, dev, ino);
-			}
-		}
-		reset_journal_idle(name);
+	if (!snapshot_object(d, detail::channel_shm_name(name), "retained-object")) {
+		d.fail("C12 failed to preserve object snapshot");
 	}
 
 	d.write_evidence("recovery_result.txt", ev);
@@ -783,6 +790,13 @@ static bool run_c13(CaseDriver& d) {
 		return d.ok();
 	}
 
+	const std::string retained_creator = shm + ".creator-retained";
+	if (::link(("/dev/shm" + shm).c_str(), ("/dev/shm" + retained_creator).c_str()) != 0 ||
+	    !snapshot_object(d, retained_creator, "creator-before-aba")) {
+		d.fail("C13 failed to preserve creator inode before intentional ABA replacement");
+		d.finish_case(gen_pids_line("C13", victim));
+		return d.ok();
+	}
 	if (!detail::shm_unlink_checked(shm, dev0, ino0)) {
 		d.fail("C13 unlink of creator object failed");
 		d.finish_case(gen_pids_line("C13", victim));
@@ -813,7 +827,6 @@ static bool run_c13(CaseDriver& d) {
 	auto p = Producer<TestPayloadV1>::create(opts, TestPayloadV1Schema());
 	if (p) {
 		d.fail("C13 recovery must not touch the stranger's object");
-		(void)p.value().remove_if_owner();
 	} else {
 		const std::string code = to_string(p.error().code);
 		ev += "create blocked code=" + code + " ctx=" + p.error().context + "\n";
@@ -839,15 +852,8 @@ static bool run_c13(CaseDriver& d) {
 		}
 	}
 
-	{
-		auto fd3 = detail::shm_open_existing(shm);
-		if (fd3) {
-			uint64_t dev = 0, ino = 0;
-			if (detail::shm_fstat_and_capture(fd3.value(), &dev, &ino, nullptr)) {
-				(void)detail::shm_unlink_checked(shm, dev, ino);
-			}
-		}
-		reset_journal_idle(name);
+	if (!snapshot_object(d, shm, "retained-object")) {
+		d.fail("C13 failed to preserve replacement object snapshot");
 	}
 
 	d.write_evidence("recovery_result.txt", ev);
