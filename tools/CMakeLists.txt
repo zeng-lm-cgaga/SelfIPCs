@@ -170,6 +170,10 @@ if(BUILD_TESTING)
   set_tests_properties(buffer_pool_bench_smoke PROPERTIES TIMEOUT 120 LABELS benchmark)
 
   if(Python3_Interpreter_FOUND)
+    add_test(NAME notification_service_configuration
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_notification_service.py)
+    set_tests_properties(notification_service_configuration PROPERTIES
+      TIMEOUT 10 LABELS integration ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
     add_test(NAME software_notification_management_regression
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_software_notification_management.py)
     set_tests_properties(software_notification_management_regression PROPERTIES

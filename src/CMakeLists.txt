@@ -12,6 +12,7 @@ add_library(self_ipcs STATIC
   edge_runtime/channel/slot_protocol.cpp
   edge_runtime/queue/mpmc_queue.cpp
   edge_runtime/buffer/shared_buffer_pool.cpp
+  edge_runtime/buffer/pool_queue.cpp
   edge_runtime/process/process_identity.cpp
   edge_runtime/process/process_spawn.cpp
   edge_runtime/process/supervisor_impl.cpp

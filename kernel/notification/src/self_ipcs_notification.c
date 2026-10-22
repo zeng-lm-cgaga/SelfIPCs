@@ -106,10 +106,7 @@ static ssize_t notification_write(struct file* file, const char __user* buffer, 
 
 	(void)position;
 	if (length != sizeof(increment)) return -EINVAL;
-	result = notification_lock(file, state);
-	if (result) return result;
 	if (copy_from_user(&increment, buffer, sizeof(increment))) {
-		mutex_unlock(&state->operation_lock);
 		return -EFAULT;
 	}
 	spin_lock(&state->state_lock);
@@ -124,32 +121,28 @@ static ssize_t notification_write(struct file* file, const char __user* buffer, 
 		result = sizeof(increment);
 	}
 	spin_unlock(&state->state_lock);
-	mutex_unlock(&state->operation_lock);
 	if (result > 0) notification_wake(state);
 	return result;
 }
 
 static long notification_ioctl(struct file* file, unsigned int command, unsigned long argument) {
 	struct notification_state* state = file->private_data;
-	int result;
 
 	if (command == SELF_IPCS_NOTIFICATION_GET_INFO) {
 		const struct self_ipcs_notification_info info = {
 		        .abi_version = SELF_IPCS_NOTIFICATION_ABI,
 		        .struct_size = sizeof(struct self_ipcs_notification_info),
 		        .capabilities = SELF_IPCS_NOTIFICATION_CAP_COUNTER |
-		                        SELF_IPCS_NOTIFICATION_CAP_STOP,
+		                        SELF_IPCS_NOTIFICATION_CAP_STOP |
+		                        SELF_IPCS_NOTIFICATION_CAP_INDEPENDENT_WRITES,
 		};
 		return copy_to_user((void __user*)argument, &info, sizeof(info)) ? -EFAULT : 0;
 	}
 	if (command != SELF_IPCS_NOTIFICATION_STOP) return -ENOTTY;
 	if (argument) return -EINVAL;
-	result = notification_lock(file, state);
-	if (result) return result;
 	spin_lock(&state->state_lock);
 	state->stopped = true;
 	spin_unlock(&state->state_lock);
-	mutex_unlock(&state->operation_lock);
 	notification_wake(state);
 	return 0;
 }

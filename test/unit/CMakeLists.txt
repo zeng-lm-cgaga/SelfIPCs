@@ -32,6 +32,16 @@ edgeruntime_unit_test(supervisor_policy_test)     # 重启上限、退避和参�
 edgeruntime_unit_test(mpmc_layout_test)           # MPMC 共享内存 ABI 和映射边界
 edgeruntime_unit_test(queue_feature_test PROPERTIES TIMEOUT 10)
 edgeruntime_unit_test(pool_wait_feature_test PROPERTIES TIMEOUT 10)
+edgeruntime_unit_test(pool_mapping_lifetime_test PROPERTIES TIMEOUT 8)
+target_link_options(pool_mapping_lifetime_test PRIVATE
+  "LINKER:--wrap=_ZN12edge_runtime6detail10futex_waitEPKvjPK8timespec")
+edgeruntime_unit_test(pool_queue_test PROPERTIES TIMEOUT 8)
+target_link_options(pool_queue_test PRIVATE
+  "LINKER:--wrap=_ZN12edge_runtime6detail17failpoint_triggerEPKNS0_15FailpointRecordE")
+if(TARGET SelfIPCs::async)
+  edgeruntime_unit_test(async_close_test PROPERTIES TIMEOUT 8 LABELS async)
+  target_link_libraries(async_close_test PRIVATE SelfIPCs::async)
+endif()
 edgeruntime_unit_test(shared_buffer_pool_test)    # 固定块池 ABI、状态和 handle 校验
 edgeruntime_unit_test(owner_snapshot_test)        # MPMC/Pool 共享 owner tuple 与 epoch 边界
 edgeruntime_unit_test(identity_failure_test)

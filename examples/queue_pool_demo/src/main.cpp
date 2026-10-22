@@ -8,6 +8,7 @@
 #include <system_error>
 
 #include "queue_pool_demo/api.hpp"
+#include "queue_pool_demo/handoff_flow.hpp"
 #include "queue_pool_demo/pool_flow.hpp"
 #include "queue_pool_demo/queue_flow.hpp"
 
@@ -24,6 +25,17 @@ bool parse_positive(const char* argument, int* value) {
 int main(int argc, char** argv) {
 	(void)std::setvbuf(stdout, nullptr, _IOLBF, 0);
 	try {
+		if (argc == 5 && (std::string_view(argv[1]) == "--handoff-producer" ||
+		                  std::string_view(argv[1]) == "--handoff-consumer")) {
+			int descriptor = -1;
+			int parent_pid = -1;
+			if (!parse_positive(argv[3], &descriptor) ||
+			    !parse_positive(argv[4], &parent_pid) || ::getppid() != parent_pid)
+				return 2;
+			return queue_pool_demo::run_handoff_helper(
+			        argv[2], descriptor,
+			        std::string_view(argv[1]) == "--handoff-producer");
+		}
 		if (argc == 5 && (std::string_view(argv[1]) == "--queue-helper" ||
 		                  std::string_view(argv[1]) == "--pool-helper")) {
 			int descriptor = -1;
@@ -55,8 +67,10 @@ int main(int argc, char** argv) {
 		}
 		std::printf("queue_pool_demo: package=%s C++17 queue + Pool waits\n",
 		            queue_pool_demo::kPackageName);
-		return queue_pool_demo::run_queue_flow() && queue_pool_demo::run_pool_flow() ? 0
-		                                                                             : 1;
+		return queue_pool_demo::run_queue_flow() && queue_pool_demo::run_pool_flow() &&
+		                       queue_pool_demo::run_handoff_flow()
+		               ? 0
+		               : 1;
 	} catch (const std::exception& error) {
 		std::fprintf(stderr, "queue_pool_demo: exception: %s\n", error.what());
 		return 1;

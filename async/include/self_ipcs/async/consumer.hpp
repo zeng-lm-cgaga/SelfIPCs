@@ -37,6 +37,8 @@ class ConsumerState {
 	                                                Read read, Status status) const;
 	void cancel() const;
 	void stop() const;
+	static boost::asio::awaitable<Result<void>> async_close_owned(
+	        std::shared_ptr<ConsumerState> state);
 
        private:
 	struct Impl;
@@ -107,6 +109,9 @@ class Consumer {
 		if (state_) state_->stop();
 	}
 	void close() const { stop(); }
+	boost::asio::awaitable<Result<void>> async_close() const {
+		return detail::ConsumerState::async_close_owned(state_);
+	}
 
        private:
 	struct Source {

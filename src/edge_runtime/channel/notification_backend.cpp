@@ -55,7 +55,8 @@ bool notification_fd_valid(int fd, NotificationBackend backend) noexcept {
 	return queried && info.abi_version == SELF_IPCS_NOTIFICATION_ABI &&
 	       info.struct_size == sizeof(info) &&
 	       info.capabilities ==
-	               (SELF_IPCS_NOTIFICATION_CAP_COUNTER | SELF_IPCS_NOTIFICATION_CAP_STOP) &&
+	               (SELF_IPCS_NOTIFICATION_CAP_COUNTER | SELF_IPCS_NOTIFICATION_CAP_STOP |
+	                SELF_IPCS_NOTIFICATION_CAP_INDEPENDENT_WRITES) &&
 	       info.reserved[0] == 0 && info.reserved[1] == 0;
 }
 
@@ -82,9 +83,7 @@ Result<void> notification_signal(int fd, NotificationBackend backend) noexcept {
 		if (count == static_cast<ssize_t>(sizeof(value))) return Result<void>::ok();
 		if (count < 0 && errno == EAGAIN && backend == NotificationBackend::kEventFd)
 			return Result<void>::ok();
-		if (count < 0 && (errno == EINTR ||
-		                  (errno == EAGAIN && backend == NotificationBackend::kDriver)))
-			continue;
+		if (count < 0 && errno == EINTR) continue;
 		if (count >= 0) errno = EIO;
 		return failure("notification write failed");
 	}

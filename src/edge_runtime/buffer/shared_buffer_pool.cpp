@@ -1,24 +1,25 @@
 #include "edge_runtime/buffer/shared_buffer_pool.hpp"
 
-#include "edge_runtime/channel/channel_layout.hpp"
-#include "edge_runtime/utility/checksum.hpp"
-#include "edge_runtime/process/process_identity.hpp"
-#include "edge_runtime/utility/random.hpp"
-#include "edge_runtime/utility/failpoint.hpp"
-#include "edge_runtime/utility/local_diagnostics.hpp"
-#include "edge_runtime/sync/cancellation.hpp"
-#include "edge_runtime/sync/futex.hpp"
-#include "edge_runtime/sync/shared_atomic.hpp"
-#include "edge_runtime/sync/owner_snapshot.hpp"
-#include "edge_runtime/buffer/shared_buffer_pool_layout.hpp"
-#include "edge_runtime/transport/shm_object.hpp"
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstring>
 
-#include <unistd.h>
+#include "edge_runtime/buffer/shared_buffer_pool_layout.hpp"
+#include "edge_runtime/channel/channel_layout.hpp"
+#include "edge_runtime/process/process_identity.hpp"
+#include "edge_runtime/sync/cancellation.hpp"
+#include "edge_runtime/sync/futex.hpp"
+#include "edge_runtime/sync/owner_snapshot.hpp"
+#include "edge_runtime/sync/shared_atomic.hpp"
+#include "edge_runtime/transport/shm_object.hpp"
+#include "edge_runtime/utility/checksum.hpp"
+#include "edge_runtime/utility/failpoint.hpp"
+#include "edge_runtime/utility/local_diagnostics.hpp"
+#include "edge_runtime/utility/random.hpp"
 
 namespace edge_runtime::detail {
 
@@ -28,6 +29,7 @@ struct SharedBufferPoolHandle {
 	ProcessIdentity self;
 	bool created{false};
 	bool removed{false};
+	std::atomic<uint64_t> mapping_users{0};
 	LocalDiagnostics diagnostics;
 
 	SharedBufferPoolHeaderAbi* header() noexcept {
@@ -39,6 +41,59 @@ struct SharedBufferPoolHandle {
 };
 
 namespace {
+
+constexpr uint64_t kRemovingMapping = uint64_t{1} << 63;
+
+class MappingUse {
+       public:
+	explicit MappingUse(const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept
+	    : handle_(handle.get()) {
+		if (!handle_) return;
+		uint64_t users = handle_->mapping_users.load(std::memory_order_acquire);
+		while (users < kRemovingMapping - 1) {
+			if (handle_->mapping_users.compare_exchange_weak(
+			            users, users + 1, std::memory_order_acq_rel)) {
+				entered_ = true;
+				return;
+			}
+		}
+	}
+	~MappingUse() {
+		if (entered_) handle_->mapping_users.fetch_sub(1, std::memory_order_release);
+	}
+	explicit operator bool() const noexcept { return entered_; }
+	MappingUse(const MappingUse&) = delete;
+	MappingUse& operator=(const MappingUse&) = delete;
+
+       private:
+	SharedBufferPoolHandle* handle_;
+	bool entered_{false};
+};
+
+Error mapping_unavailable() noexcept {
+	return make_error(ErrorCode::kBufferPoolContention, "SharedBufferPool",
+	                  "local mapping removal in progress");
+}
+
+class MappingRemoval {
+       public:
+	explicit MappingRemoval(SharedBufferPoolHandle* handle) noexcept : handle_(handle) {
+		uint64_t expected = 0;
+		entered_ =
+		        handle_ && handle_->mapping_users.compare_exchange_strong(
+		                           expected, kRemovingMapping, std::memory_order_acq_rel);
+	}
+	~MappingRemoval() {
+		if (entered_) handle_->mapping_users.store(0, std::memory_order_release);
+	}
+	explicit operator bool() const noexcept { return entered_; }
+	MappingRemoval(const MappingRemoval&) = delete;
+	MappingRemoval& operator=(const MappingRemoval&) = delete;
+
+       private:
+	SharedBufferPoolHandle* handle_;
+	bool entered_{false};
+};
 
 BufferPoolOwnerAbi owner_from_process(const ProcessIdentity& identity) noexcept {
 	return {identity.pid, identity.proc_start_ticks, identity.boot_id_hash_hi,
@@ -520,6 +575,11 @@ Result<std::shared_ptr<SharedBufferPoolHandle>> shared_buffer_pool_open_impl(
 
 Result<WriteBuffer> shared_buffer_pool_try_acquire_write_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	MappingUse use(handle);
+	if (!use)
+		return handle ? mapping_unavailable()
+		              : make_error(ErrorCode::kStaleHandle,
+		                           "SharedBufferPool::try_acquire_write", "empty handle");
 	if (handle) handle->diagnostics.add(DiagnosticCounter::kAcquireAttempts);
 	const auto acquire_once = [&handle]() noexcept -> Result<WriteBuffer> {
 		auto valid = validate_live_pool(handle, "SharedBufferPool::try_acquire_write");
@@ -658,6 +718,12 @@ Result<WriteBuffer> shared_buffer_pool_try_acquire_write_impl(
 Result<WriteBuffer> shared_buffer_pool_wait_acquire_write_until_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle,
         std::chrono::steady_clock::time_point deadline, const CancellationToken& token) noexcept {
+	MappingUse use(handle);
+	if (!use)
+		return handle ? mapping_unavailable()
+		              : make_error(ErrorCode::kStaleHandle,
+		                           "SharedBufferPool::wait_acquire_write_until",
+		                           "empty handle");
 	if (handle) handle->diagnostics.add(DiagnosticCounter::kWaitCalls);
 	auto valid = validate_live_pool(handle, "SharedBufferPool::wait_acquire_write_until");
 	if (!valid) return valid.error();
@@ -752,6 +818,7 @@ Result<BufferHandle> shared_buffer_pool_publish_write_impl(WriteBuffer* buffer) 
 	buffer->active_ = false;
 	buffer->block_ = nullptr;
 	buffer->data_ = nullptr;
+	buffer->pool_->mapping_users.fetch_sub(1, std::memory_order_release);
 	buffer->pool_.reset();
 	return Result<BufferHandle>(descriptor);
 }
@@ -773,12 +840,18 @@ void shared_buffer_pool_abort_write_impl(WriteBuffer* buffer) noexcept {
 	buffer->active_ = false;
 	buffer->block_ = nullptr;
 	buffer->data_ = nullptr;
+	if (buffer->pool_) buffer->pool_->mapping_users.fetch_sub(1, std::memory_order_release);
 	buffer->pool_.reset();
 }
 
 Result<ReadBuffer> shared_buffer_pool_acquire_read_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle,
         const BufferHandle& descriptor) noexcept {
+	MappingUse use(handle);
+	if (!use)
+		return handle ? mapping_unavailable()
+		              : make_error(ErrorCode::kStaleHandle,
+		                           "SharedBufferPool::acquire_read", "empty handle");
 	auto valid = validate_descriptor(handle, descriptor, "SharedBufferPool::acquire_read");
 	if (!valid) return valid.error();
 	auto* block = block_at(handle.get(), descriptor.block_id);
@@ -868,6 +941,21 @@ Result<ReadBuffer> shared_buffer_pool_acquire_read_impl(
 
 void shared_buffer_pool_release_read_impl(ReadBuffer* buffer) noexcept {
 	if (buffer == nullptr || !buffer->active_) return;
+	auto released = shared_buffer_pool_release_read_checked_impl(buffer);
+	if (released) return;
+	buffer->active_ = false;
+	buffer->block_ = nullptr;
+	buffer->data_ = nullptr;
+	if (buffer->pool_) buffer->pool_->mapping_users.fetch_sub(1, std::memory_order_release);
+	buffer->pool_.reset();
+}
+
+Result<void> shared_buffer_pool_release_read_checked_impl(ReadBuffer* buffer) noexcept {
+	if (buffer == nullptr || !buffer->active_) {
+		return make_error(ErrorCode::kBufferStateMismatch, "ReadBuffer::release_checked",
+		                  "buffer inactive");
+	}
+	bool released = false;
 	if (buffer->pool_ && buffer->block_ != nullptr && !buffer->pool_->removed &&
 	    static_cast<uint64_t>(::getpid()) == buffer->pool_->self.pid) {
 		auto* block = static_cast<SharedBufferBlockHeaderAbi*>(buffer->block_);
@@ -878,16 +966,27 @@ void shared_buffer_pool_release_read_impl(ReadBuffer* buffer) noexcept {
 		    shared_load_seq_cst(&block->block_generation) ==
 		            buffer->descriptor_.block_generation) {
 			publish_free(buffer->pool_.get(), block);
+			released = true;
 		}
 	}
+	if (!released)
+		return make_error(ErrorCode::kRecoveryBlocked, "ReadBuffer::release_checked",
+		                  "read ownership changed");
 	buffer->active_ = false;
 	buffer->block_ = nullptr;
 	buffer->data_ = nullptr;
+	if (buffer->pool_) buffer->pool_->mapping_users.fetch_sub(1, std::memory_order_release);
 	buffer->pool_.reset();
+	return {};
 }
 
 Result<SharedBufferPoolStatus> shared_buffer_pool_status_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	MappingUse use(handle);
+	if (!use)
+		return handle ? mapping_unavailable()
+		              : make_error(ErrorCode::kStaleHandle, "SharedBufferPool::status",
+		                           "empty handle");
 	auto valid = validate_live_pool(handle, "SharedBufferPool::status");
 	if (!valid) return valid.error();
 	const auto* header = handle->header();
@@ -983,6 +1082,11 @@ Result<SharedBufferPoolStatus> shared_buffer_pool_status_impl(
 
 Result<void> shared_buffer_pool_remove_if_creator_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	MappingRemoval removal(handle.get());
+	if (!removal)
+		return handle ? mapping_unavailable()
+		              : make_error(ErrorCode::kStaleHandle,
+		                           "SharedBufferPool::remove_if_creator", "empty handle");
 	auto valid = validate_live_pool(handle, "SharedBufferPool::remove_if_creator");
 	if (!valid) return valid.error();
 	if (!owner_matches(handle->header()->creator, handle->self)) {
@@ -1025,16 +1129,22 @@ Result<void> shared_buffer_pool_remove_if_creator_impl(
 
 uint32_t shared_buffer_pool_block_size_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	MappingUse use(handle);
+	if (!use) return 0;
 	return handle && !handle->removed ? handle->header()->block_size : 0;
 }
 
 uint32_t shared_buffer_pool_block_count_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	MappingUse use(handle);
+	if (!use) return 0;
 	return handle && !handle->removed ? handle->header()->block_count : 0;
 }
 
 uint64_t shared_buffer_pool_generation_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	MappingUse use(handle);
+	if (!use) return 0;
 	return handle && !handle->removed ? handle->header()->generation : 0;
 }
 
@@ -1049,7 +1159,9 @@ WriteBuffer::WriteBuffer(std::shared_ptr<detail::SharedBufferPoolHandle> pool, v
       data_(data),
       size_(size),
       descriptor_(descriptor),
-      active_(true) {}
+      active_(true) {
+	pool_->mapping_users.fetch_add(1, std::memory_order_relaxed);
+}
 
 WriteBuffer::WriteBuffer(WriteBuffer&& other) noexcept
     : pool_(std::move(other.pool_)),
@@ -1097,7 +1209,9 @@ ReadBuffer::ReadBuffer(std::shared_ptr<detail::SharedBufferPoolHandle> pool, voi
       data_(data),
       size_(size),
       descriptor_(descriptor),
-      active_(true) {}
+      active_(true) {
+	pool_->mapping_users.fetch_add(1, std::memory_order_relaxed);
+}
 
 ReadBuffer::ReadBuffer(ReadBuffer&& other) noexcept
     : pool_(std::move(other.pool_)),
@@ -1133,5 +1247,9 @@ ReadBuffer& ReadBuffer::operator=(ReadBuffer&& other) noexcept {
 ReadBuffer::~ReadBuffer() { release(); }
 
 void ReadBuffer::release() noexcept { detail::shared_buffer_pool_release_read_impl(this); }
+
+Result<void> ReadBuffer::release_checked() noexcept {
+	return detail::shared_buffer_pool_release_read_checked_impl(this);
+}
 
 }  // namespace edge_runtime

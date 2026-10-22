@@ -11,6 +11,7 @@
 #define SELF_IPCS_NOTIFICATION_ABI 1U
 #define SELF_IPCS_NOTIFICATION_CAP_COUNTER (1ULL << 0)
 #define SELF_IPCS_NOTIFICATION_CAP_STOP (1ULL << 1)
+#define SELF_IPCS_NOTIFICATION_CAP_INDEPENDENT_WRITES (1ULL << 2)
 
 struct self_ipcs_notification_info {
 	__u32 abi_version;

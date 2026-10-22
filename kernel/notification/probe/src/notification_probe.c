@@ -262,7 +262,8 @@ int notification_probe_run(const char* device) {
 	REQUIRE(ioctl(original, SELF_IPCS_NOTIFICATION_GET_INFO, &info) == 0);
 	REQUIRE(info.abi_version == SELF_IPCS_NOTIFICATION_ABI && info.struct_size == sizeof(info));
 	REQUIRE(info.capabilities ==
-	        (SELF_IPCS_NOTIFICATION_CAP_COUNTER | SELF_IPCS_NOTIFICATION_CAP_STOP));
+	        (SELF_IPCS_NOTIFICATION_CAP_COUNTER | SELF_IPCS_NOTIFICATION_CAP_STOP |
+	         SELF_IPCS_NOTIFICATION_CAP_INDEPENDENT_WRITES));
 	REQUIRE(info.reserved[0] == 0 && info.reserved[1] == 0);
 	REQUIRE(ioctl(original, SELF_IPCS_NOTIFICATION_GET_INFO, (void*)1) == -1 &&
 	        errno == EFAULT);

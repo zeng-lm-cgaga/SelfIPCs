@@ -15,6 +15,10 @@
 
 namespace edge_runtime {
 
+template <typename T>
+class MpmcQueue;
+struct PoolQueueSendResult;
+
 struct BufferHandle {
 	uint64_t pool_generation{0};
 	uint64_t block_generation{0};
@@ -104,6 +108,7 @@ void shared_buffer_pool_abort_write_impl(WriteBuffer* buffer) noexcept;
 Result<ReadBuffer> shared_buffer_pool_acquire_read_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle, const BufferHandle& descriptor) noexcept;
 void shared_buffer_pool_release_read_impl(ReadBuffer* buffer) noexcept;
+Result<void> shared_buffer_pool_release_read_checked_impl(ReadBuffer* buffer) noexcept;
 }  // namespace detail
 
 class WriteBuffer {
@@ -124,6 +129,9 @@ class WriteBuffer {
 	void abort() noexcept;
 
        private:
+	friend PoolQueueSendResult send_buffer_until(WriteBuffer&, MpmcQueue<BufferHandle>&,
+	                                             std::chrono::steady_clock::time_point,
+	                                             const CancellationToken&) noexcept;
 	friend Result<WriteBuffer> detail::shared_buffer_pool_try_acquire_write_impl(
 	        const std::shared_ptr<detail::SharedBufferPoolHandle>& handle) noexcept;
 	friend Result<BufferHandle> detail::shared_buffer_pool_publish_write_impl(
@@ -155,12 +163,15 @@ class ReadBuffer {
 	bool active() const noexcept { return active_; }
 
 	void release() noexcept;
+	Result<void> release_checked() noexcept;
 
        private:
 	friend Result<ReadBuffer> detail::shared_buffer_pool_acquire_read_impl(
 	        const std::shared_ptr<detail::SharedBufferPoolHandle>& handle,
 	        const BufferHandle& descriptor) noexcept;
 	friend void detail::shared_buffer_pool_release_read_impl(ReadBuffer* buffer) noexcept;
+	friend Result<void> detail::shared_buffer_pool_release_read_checked_impl(
+	        ReadBuffer* buffer) noexcept;
 
 	ReadBuffer(std::shared_ptr<detail::SharedBufferPoolHandle> pool, void* block,
 	           const std::byte* data, uint32_t size, BufferHandle descriptor) noexcept;

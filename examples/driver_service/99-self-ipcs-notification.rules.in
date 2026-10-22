@@ -1,0 +1,1 @@
+KERNEL=="self_ipcs_notification", SUBSYSTEM=="misc", OWNER="root", GROUP="@DEVICE_GROUP@", MODE="0660"

@@ -28,6 +28,7 @@ class HelperProcess {
 	bool stop();
 	bool running() const noexcept { return pid_ > 0; }
 	pid_t pid() const noexcept { return pid_; }
+	int control_descriptor() const noexcept { return descriptor_; }
 
        private:
 	bool reap_until(Clock::time_point deadline);

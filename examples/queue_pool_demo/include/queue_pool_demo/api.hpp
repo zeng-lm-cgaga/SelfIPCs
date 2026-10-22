@@ -2,6 +2,7 @@
 #define SELF_IPCS_QUEUE_POOL_DEMO_API_HPP
 
 #if defined(SELFIPCS_DEMO_USE_LEGACY)
+#include "edge_runtime/buffer/pool_queue.hpp"
 #include "edge_runtime/buffer/shared_buffer_pool.hpp"
 #include "edge_runtime/common/cancellation.hpp"
 #include "edge_runtime/common/diagnostics.hpp"
@@ -9,6 +10,7 @@
 #include "edge_runtime/common/schema.hpp"
 #include "edge_runtime/queue/mpmc_queue.hpp"
 #else
+#include "self_ipcs/buffer/pool_queue.hpp"
 #include "self_ipcs/buffer/shared_buffer_pool.hpp"
 #include "self_ipcs/common/cancellation.hpp"
 #include "self_ipcs/common/diagnostics.hpp"

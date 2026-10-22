@@ -128,7 +128,9 @@ auto notification = consumer.event_notification(self_ipcs::NotificationBackend::
   明确拒绝时返回 `TransportFailed/EPROTONOSUPPORT`，旧端沿原注册截止时间结束交换。
 - 每次注册创建一个驱动 open-file-description，通过 SCM_RIGHTS 把同一个对象传给 consumer。
   接收端核验字符设备、设备号、读写/非阻塞/CLOEXEC 标志及 `GET_INFO` 的 ABI/能力。
-- driver 的操作锁暂忙 `EAGAIN` 至多重试 8 次；计数溢出 `EOVERFLOW` 单独报告。
+- driver 的写入先复制 8B 用户参数，再用短状态锁累加；读侧串行化覆盖复制和确认，写入与 STOP
+  独立于读侧互斥锁。正常读写争用保持注册有效，`GET_INFO` 明确要求 independent-writes 能力。
+  计数溢出 `EOVERFLOW` 保留原积压并单独报告，真实写入错误明确返回。
   发布提交始终保留成功结果，通知失败记录 errno 并关闭控制连接唤醒接收端。
   driver drain 遇到 `EAGAIN` 可以是暂忙，应用继续检查最新共享样本并保留 level-triggered 监听。
 - SDK 析构、局部取消和禁用服务按引用/控制连接收尾；原始 UAPI `STOP` 是共享通知对象的持久停止。
@@ -172,6 +174,13 @@ cmake --build /tmp/selfipcs-async-demo
 - 移动转移句柄所有权，析构请求关闭。应用保持事件循环运行，直到任务和关闭回调处理完毕，
   再销毁执行器；关闭完成时释放底层 Consumer，允许重新打开同一通道。
   等待过程持有共享操作状态，槽位借用在每次拷贝读取结束时释放。
+- `co_await consumer.async_close()` 请求持久关闭，并等待已接受的数据等待、FD/timer 取消及
+  结果投递回调收尾，释放通知和底层 Consumer 后返回。多个关闭等待者及重复关闭均可等待同一
+  关闭过程；移动后旧包装器返回 `StaleHandle`。事件循环持续运行即可在返回后重新 open。
+  同步 `close()/stop()` 只请求关闭，应用保持执行器运行直至异步关闭完成。
+
+通知和协程入口服务于 SPSC；Queue/Pool 的等待使用 futex。多个通道共享消费侧 Asio 循环，
+生产侧每个启用通知的通道各有一个控制服务线程。
 
 `examples/async_consume_demo/` 以真实 `fork/exec` producer 演示两个独立通道共用一个事件循环，
 并展示 timeout、cancel、重新等待和 close。增加 `SELFIPCS_DEMO_USE_LEGACY=ON` 可组合旧核心包入口。
@@ -210,15 +219,40 @@ sudo python3 scripts/manage_software_notification.py unload
 ```
 
 UAPI 在 `kernel/notification/include/uapi/`，安装入口为 `self_ipcs/notification/driver_uapi.h`。
-只读 `GET_INFO` 返回固定 32B 的 ABI 1 和 counter/STOP 能力；SDK 按此核验模块接口。
+只读 `GET_INFO` 返回固定 32B 的 ABI 1 和 counter/STOP/independent-writes 能力；SDK 按此核验
+模块接口。能力集合变化会明确拒绝旧模块或旧 SDK 的不匹配组合，更新时同时部署 SDK 和模块。
 `read` / `write` 使用本机字节序的固定 8B 无符号计数，
 每次成功读取确认当前全部积压；`EFAULT` 保留积压，计数溢出返回 `EOVERFLOW` 并保留原值。
-`O_NONBLOCK` 无可读通知或操作锁暂忙时返回 `EAGAIN`；阻塞读取可由信号中断并返回 `EINTR`。
+`O_NONBLOCK` 无可读通知或其他读取占用读锁时返回 `EAGAIN`；写入与 STOP 使用短状态锁。
+阻塞读取可由信号中断并返回 `EINTR`。读侧快照在成功复制后扣除，并发新增通知保留；
+复制失败 `EFAULT` 保留全部积压，溢出检查包含尚待确认的读快照。
 `SELF_IPCS_NOTIFICATION_STOP` 为持久停止：唤醒等待者，先排空已有计数，再返回 EOF / poll HUP；
 停止后的写入返回 `EPIPE`。模块以 `THIS_MODULE` 持有引用，最后一个 file 引用释放时回收对象。
 设备默认权限 `0600`，加载受当前系统模块权限和签名策略管理。
 管理脚本校验正在运行的 kernel、headers、模块名与 vermagic，卸载前检查引用数并使用普通
 `rmmod`。构建入口仅编译；加载和卸载由具备权限的操作者显式执行。
+
+### 普通服务账号部署
+
+`examples/driver_service/` 提供 udev `0660` 指定组、systemd 服务和 `/run/user/<uid>` 的
+tmpfiles `0700` 模板。管理员先创建专用普通账号 `selfipcs-demo` 和设备组 `selfipcs-notify`，
+加载与当前内核匹配的模块，使用独立安装的 SDK 构建并安装 `notification_demo` 到
+`/opt/selfipcs-demo/bin/notification_demo`，再生成配置：
+
+```bash
+python3 scripts/prepare_notification_service.py --user selfipcs-demo \
+  --device-group selfipcs-notify --executable /opt/selfipcs-demo/bin/notification_demo \
+  --output /tmp/selfipcs-service-config
+```
+
+生成器只写指定的新目录。管理员审核后显式把 `.rules`、`.conf`、`.service` 分别安装到
+`/etc/udev/rules.d/`、`/etc/tmpfiles.d/`、`/etc/systemd/system/`，执行
+`systemd-tmpfiles --create /etc/tmpfiles.d/self-ipcs-notification.conf`、
+`udevadm control --reload-rules`、`udevadm trigger --action=add /sys/class/misc/self_ipcs_notification`、
+`systemctl daemon-reload` 和 `systemctl start self-ipcs-notification.service`。
+服务以指定普通账号和补充设备组运行，设备缺失 `ENOENT`、权限不足 `EACCES` 保留原 errno。
+结束时先停止服务、关闭全部设备引用，再正常卸载模块；撤销配置后重新加载规则、服务配置，
+由管理员恢复设备 `root:root 0600`。运行目录的 UID、属主和 `0700` 同通道创建账号一致。
 
 有限对照入口 `scripts/run_notification_matrix.py` 与独立验证器
 `scripts/verify_notification_matrix.py` 固定 64B、100/1000Hz、同核/跨核，每后端各三轮。
@@ -232,6 +266,8 @@ UAPI 在 `kernel/notification/include/uapi/`，安装入口为 `self_ipcs/notifi
 MPMC 和 SharedBufferPool 新建实例使用 **ABI 3.0**；新旧库在 `open` 时按 major 显式拒绝
 ABI 2.0/3.0 混用，返回 `AbiMismatch`。升级时先由原 creator 按所有权排空、释放并移除旧实例，
 再创建新实例。SPSC 布局、`BufferHandle` 的 88B 结构、共享对象命名和身份校验沿用现有契约。
+本开发分支暂沿 CMake `0.4.0` 包版本标记；ABI 3 及本分支新增能力按开发提交标识，历史已发布
+`v0.4.0` 的内容和验收记录保持原归属。正式打包时由维护者统一确定新版本与迁移清单。
 
 - **全局关闭**：仅队列 creator 进程的匹配身份可以调用 `close()`。关闭与 push 共用 enqueue gate：
   已获 gate 的 push 完整提交后，close 才能提交关闭；之后的 push 返回 `Closed`。close 遇到活动 gate
@@ -242,6 +278,8 @@ ABI 2.0/3.0 混用，返回 `AbiMismatch`。升级时先由原 creator 按所有
   source/token 共享一次性取消，token 保持状态存活；source 析构只释放引用，重新开始使用新的 source。其他普通线程可调用
   `request_cancel()`；信号处理与跨进程传递使用各自的应用层通知。fork 后独立 open 句柄，exec 后
   创建本进程 token。新增错误 `Closed`、`Cancelled` 追加在既有错误码之后。
+  同一取消状态可影响多个等待/批量操作；限定单个调用时为它创建独立 source。取消保留已成功
+  提交或取得的数据，队列全局 close 单独控制。
 - **等待结果**：`wait_push_until(value, deadline, token)`、`wait_pop_until(deadline, token)` 和
   `wait_acquire_write_until(deadline, token)` 使用单一 steady-clock 绝对时限。每次唤醒、超时和取消
   都重新检查实际操作；已提交/取得的数据优先成功，永久错误与 `Closed` 优先于取消，仍需等待时
@@ -251,11 +289,30 @@ ABI 2.0/3.0 混用，返回 `AbiMismatch`。升级时先由原 creator 按所有
   返回 `BatchResult{count, reason, error}`，最多 256 个元素，零长度完成。成功前缀始终保留，
   `reason` 区分 Complete、Full、Empty、Closed、Cancelled、Contention、Error；`error` 在提前终止时有效。
   每个元素独立提交、释放 gate 并通知，其他批次可以交错，FIFO 顺序按成功入队元素定义。
+  256 限定单次元素数，队列 capacity 单独配置；逐元素同步的吞吐和 CPU 由同条件测量记录。
   批次在开始下个元素前检查取消；成功前缀仍可消费，整批原子性由应用层组合协议提供。
 - **等待空闲块**：Pool 返回 RAII `WriteBuffer`，合法 abort/归还先发布 FREE 再通知全部等待者。
   注册、epoch 快照、复查和 futex 等待覆盖检查到入睡的窗口；睡眠只保留句柄与取消注册，
   池控制锁和待归还块可供其他参与方使用。
   进程退出、代次不符与所有权不明沿原 fail-closed 路径处理。
+  本地映射准入计数覆盖等待、取消注册、元信息访问及 WriteBuffer/ReadBuffer 的资源期。
+  `remove_if_creator()` 与新准入原子互斥，有在途访问或借用时返回 `BufferPoolContention`；
+  删除失败保持映射。停机顺序为停止新申请、取消等待、等任务退出、归还块、按身份删除。
+  本地保护覆盖同一 handle；跨进程停机由应用协调，其他进程 unlink 名称仍保留本进程映射。
+
+### Pool 与 Queue 组合发送
+
+`self_ipcs/buffer/pool_queue.hpp` 的 `send_buffer_until(write, queue, deadline, token)`
+发布 WriteBuffer 并有界投递描述符，底层 Pool/Queue 继续独立使用。
+`PoolQueueSendResult` 区分 `kPublishFailed`（写块仍归调用方）、`kEnqueued`（消费链路归还）、
+`kReturned`（入队失败且已归还）和 `kCleanupRequired`（保留描述符、原入队错误及归还错误）。
+归还失败且已取得读所有权时，结果的 `pending_read` 保留该 RAII 资源，调用方可用
+`release_checked()` 重试并检查错误；未取得读所有权时按描述符与 Pool 状态协调处置。
+入队成功后辅助接口仅移交所有权，消费方可能立即取得块。
+`examples/queue_pool_demo/` 使用新旧安装入口演示组合发送与父进程保留描述符收尾。
+publish/enqueue 之间生产者退出、pop/acquire_read 之间消费者退出由应用确认参与方停止后
+按实例身份归还或重建；业务 ACK、持久化和重发属于应用协议。FIFO 表达成功出队顺序，
+业务完成顺序可不同；deadline 限定等待预算，业务过期拒发另检查业务时间戳。
 
 ### 可选本地诊断
 

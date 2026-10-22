@@ -3,12 +3,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <cerrno>
-#include <cstdint>
-#include <mutex>
-#include <new>
-#include <optional>
-
 #include <boost/asio/associated_executor.hpp>
 #include <boost/asio/async_result.hpp>
 #include <boost/asio/bind_executor.hpp>
@@ -19,6 +13,12 @@
 #include <boost/asio/strand.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/system/system_error.hpp>
+#include <cerrno>
+#include <cstdint>
+#include <mutex>
+#include <new>
+#include <optional>
+#include <vector>
 
 namespace edge_runtime::async::detail {
 namespace {
@@ -40,7 +40,8 @@ Error asio_error(const boost::system::error_code& error, const char* context) {
 }
 
 struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
-	using Completion = std::function<void(Result<void>)>;
+	using Completion = std::function<void(Result<void>, bool)>;
+	using CloseCompletion = std::function<void(Result<void>)>;
 
 	struct Operation {
 		std::shared_ptr<Impl> owner;
@@ -66,6 +67,7 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 	}
 
 	void close_resources() {
+		if (resources_closed) return;
 		boost::system::error_code ignored;
 		descriptor.close(ignored);
 		notification.reset();
@@ -74,6 +76,24 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 			release_consumer = {};
 		}
 		consumer_owner.reset();
+		resources_closed = true;
+	}
+
+	void complete_close() {
+		if (!stopped || !active.expired() || pending_deliveries != 0) return;
+		{
+			std::lock_guard<std::mutex> guard(admission_mutex);
+			if (!reserved.expired()) return;
+		}
+		close_resources();
+		auto waiters = std::move(close_waiters);
+		close_waiters.clear();
+		for (auto& waiter : waiters) waiter(Result<void>{});
+	}
+
+	void delivery_done() {
+		--pending_deliveries;
+		complete_close();
 	}
 
 	void finish(const std::shared_ptr<Operation>& operation) {
@@ -85,8 +105,9 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 			std::lock_guard<std::mutex> guard(admission_mutex);
 			if (reserved.lock() == operation) reserved.reset();
 		}
-		if (stopped) close_resources();
-		completion(std::move(result));
+		++pending_deliveries;
+		completion(std::move(result), true);
+		complete_close();
 	}
 
 	void choose(const std::shared_ptr<Operation>& operation, Result<void> result) {
@@ -231,7 +252,7 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 				}
 			}
 		}
-		if (rejected) operation->completion(rejected.value());
+		if (rejected) operation->completion(rejected.value(), false);
 	}
 
 	void start(const std::shared_ptr<Operation>& operation) {
@@ -271,8 +292,18 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 		if (auto operation = active.lock()) {
 			choose(operation, canceled("stop"));
 		} else {
-			close_resources();
+			complete_close();
 		}
+	}
+
+	void post_close(CloseCompletion completion) {
+		std::lock_guard<std::mutex> guard(admission_mutex);
+		stop_requested = true;
+		boost::asio::post(strand, [self = shared_from_this(),
+		                           completion = std::move(completion)]() mutable {
+			self->close_waiters.push_back(std::move(completion));
+			self->request_stop();
+		});
 	}
 
 	std::shared_ptr<void> consumer_owner;
@@ -284,6 +315,9 @@ struct ConsumerState::Impl : std::enable_shared_from_this<Impl> {
 	std::weak_ptr<Operation> active;
 	uint64_t active_generation = 0;
 	bool stopped = false;
+	bool resources_closed = false;
+	unsigned pending_deliveries = 0;
+	std::vector<CloseCompletion> close_waiters;
 	std::mutex admission_mutex;
 	std::weak_ptr<Operation> reserved;
 	uint64_t next_generation = 0;
@@ -333,11 +367,17 @@ boost::asio::awaitable<Result<void>> ConsumerState::wait_latest(
 	         status = std::move(status)](auto handler) mutable {
 		        auto completion_executor = boost::asio::get_associated_executor(handler);
 		        auto completion = std::make_shared<decltype(handler)>(std::move(handler));
-		        auto finish = [completion_executor, completion](Result<void> result) mutable {
+		        auto finish = [impl, completion_executor, completion](
+		                              Result<void> result, bool acknowledge) mutable {
 			        boost::asio::post(
 			                completion_executor,
-			                [completion, result = std::move(result)]() mutable {
+			                [impl, completion, acknowledge,
+			                 result = std::move(result)]() mutable {
 				                (*completion)(std::move(result));
+				                if (acknowledge)
+					                boost::asio::post(impl->strand, [impl] {
+						                impl->delivery_done();
+					                });
 			                });
 		        };
 		        impl->begin(absolute_deadline, std::move(read), std::move(status),
@@ -354,4 +394,28 @@ void ConsumerState::stop() const {
 	impl_->post_stop();
 }
 
+boost::asio::awaitable<Result<void>> ConsumerState::async_close_owned(
+        std::shared_ptr<ConsumerState> state) {
+	return boost::asio::async_initiate<decltype(boost::asio::use_awaitable),
+	                                   void(Result<void>)>(
+	        [impl = state ? state->impl_ : nullptr](auto handler) mutable {
+		        auto executor = boost::asio::get_associated_executor(handler);
+		        auto completion = std::make_shared<decltype(handler)>(std::move(handler));
+		        if (!impl) {
+			        boost::asio::post(executor, [completion]() mutable {
+				        (*completion)(make_error(ErrorCode::kStaleHandle,
+				                                 "async::Consumer::async_close",
+				                                 "moved consumer"));
+			        });
+			        return;
+		        }
+		        impl->post_close([executor, completion](Result<void> result) mutable {
+			        boost::asio::post(executor, [completion,
+			                                     result = std::move(result)]() mutable {
+				        (*completion)(std::move(result));
+			        });
+		        });
+	        },
+	        boost::asio::use_awaitable);
+}
 }

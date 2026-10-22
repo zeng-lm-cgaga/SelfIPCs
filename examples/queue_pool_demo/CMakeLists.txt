@@ -12,6 +12,7 @@ else()
 endif()
 
 add_executable(queue_pool_demo
+  src/handoff_flow.cpp
   src/main.cpp
   src/pool_flow.cpp
   src/process.cpp

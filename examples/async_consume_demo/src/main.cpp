@@ -142,7 +142,7 @@ void require(bool condition, const char* message) {
 }
 
 boost::asio::awaitable<void> consume(std::shared_ptr<AsyncConsumer> consumer, int index,
-                                    PendingRead first) {
+                                     PendingRead first, std::string channel_name) {
 	auto first_sample = co_await std::move(first);
 	require(static_cast<bool>(first_sample), "lazy read after wrapper move failed");
 	uint64_t last_sequence = first_sample.value().sequence;
@@ -174,6 +174,14 @@ boost::asio::awaitable<void> consume(std::shared_ptr<AsyncConsumer> consumer, in
 	require(!stopped && stopped.error().errno_value == ECANCELED, "close expected");
 	auto sticky = co_await consumer->async_wait_latest(Clock::now() + 1s);
 	require(!sticky && sticky.error().errno_value == ECANCELED, "sticky stop expected");
+	auto closed = co_await consumer->async_close();
+	require(static_cast<bool>(closed), "close completion expected");
+	auto closed_again = co_await consumer->async_close();
+	require(static_cast<bool>(closed_again), "repeated close completion expected");
+	ipc::ChannelOptions reopened_options;
+	reopened_options.name = std::move(channel_name);
+	auto reopened = ipc::Consumer<Message>::open(reopened_options, message_schema());
+	require(static_cast<bool>(reopened), "reopen on running event loop expected");
 	std::printf("channel=%d final_sequence=%llu value=%u timeout/cancel/rearm/close=OK\n",
 	            index, static_cast<unsigned long long>(last_sequence), last_value);
 }
@@ -230,18 +238,22 @@ bool run(ipc::NotificationBackend backend) {
 		}
 	});
 	for (int index = 0; index < 2; ++index) {
-		boost::asio::co_spawn(loop, consume(consumers[static_cast<size_t>(index)], index,
-		                                  std::move(first_reads[static_cast<size_t>(index)])),
-		                     [&](std::exception_ptr error) {
-			                     if (error) {
-				                     success = false;
-				                     try { std::rethrow_exception(error); }
-				                     catch (const std::exception& failure) {
-					                     std::fprintf(stderr, "%s\n", failure.what());
-				                     }
-			                     }
-			                     if (++completed == 2) (void)watchdog.cancel();
-		                     });
+		boost::asio::co_spawn(loop,
+		                      consume(consumers[static_cast<size_t>(index)], index,
+		                              std::move(first_reads[static_cast<size_t>(index)]),
+		                              prefix + "_" + std::to_string(index)),
+		                      [&](std::exception_ptr error) {
+			                      if (error) {
+				                      success = false;
+				                      try {
+					                      std::rethrow_exception(error);
+				                      } catch (const std::exception& failure) {
+					                      std::fprintf(stderr, "%s\n",
+					                                   failure.what());
+				                      }
+			                      }
+			                      if (++completed == 2) (void)watchdog.cancel();
+		                      });
 	}
 	if (!transfer_token(parent_socket.get(), 'G', true)) return false;
 	loop.run();

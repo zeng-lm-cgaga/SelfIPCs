@@ -13,6 +13,7 @@ else()
 endif()
 
 add_executable(notification_demo src/main.cpp)
+install(TARGETS notification_demo RUNTIME DESTINATION bin)
 target_include_directories(notification_demo PRIVATE include)
 target_compile_features(notification_demo PRIVATE cxx_std_17)
 set_target_properties(notification_demo PROPERTIES CXX_EXTENSIONS OFF)

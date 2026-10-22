@@ -1,0 +1,25 @@
+[Unit]
+Description=SelfIPCs installed-package driver demonstration
+After=systemd-tmpfiles-setup.service systemd-udevd.service
+ConditionPathExists=/dev/self_ipcs_notification
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+SupplementaryGroups=@DEVICE_GROUP@
+ExecStart=@EXECUTABLE@ --backend driver
+TimeoutStartSec=20
+TimeoutStopSec=5
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/dev/shm /run/user/@SERVICE_UID@
+DevicePolicy=closed
+DeviceAllow=/dev/self_ipcs_notification rw
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

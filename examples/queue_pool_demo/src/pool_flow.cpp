@@ -91,11 +91,17 @@ bool parent_pool_steps(ipc::SharedBufferPool& pool, HandleQueue& queue, HelperPr
 	if (!require(write.value().size() >= sizeof(kPayload), "write buffer fits payload"))
 		return false;
 	std::memcpy(write.value().data(), kPayload, sizeof(kPayload));
-	const auto descriptor = write.value().publish();
-	if (!descriptor) return report_error("Pool publish", descriptor.error());
-	published = descriptor.value();
-	const auto sent = queue.wait_push_until(*published, Clock::now() + std::chrono::seconds(3));
-	if (!sent) return report_error("Pool descriptor queue push", sent.error());
+	auto sent = ipc::send_buffer_until(write.value(), queue,
+	                                   Clock::now() + std::chrono::seconds(3));
+	if (!sent) {
+		if (sent.state == ipc::PoolQueueSendState::kCleanupRequired)
+			published = sent.descriptor;
+		if (sent.return_error) return report_error("Pool send return", *sent.return_error);
+		if (sent.enqueue_error)
+			return report_error("Pool send enqueue", *sent.enqueue_error);
+		return report_error("Pool send publish", *sent.publish_error);
+	}
+	published = sent.descriptor;
 	const auto published_full = pool.try_acquire_write();
 	if (!require(!published_full, "published descriptor occupies the only block")) return false;
 	if (published_full.error().code != ipc::ErrorCode::kBufferPoolFull)
