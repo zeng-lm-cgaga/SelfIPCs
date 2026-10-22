@@ -273,29 +273,34 @@ python3 scripts/prepare_notification_service.py --user selfipcs-demo \
 保存 raw worker、CSV、工作区间及完整进程生命周期 CPU。CPU 百分比按各进程工作区间的
 user+system CPU / 实际墙钟时间计算；生产进程包含通知控制线程。
 
-2026-10-22 Linux 虚拟机实测（采集提交 `7063a03`）：Ubuntu 22.04、Linux 6.8、GCC 11.4，
+2026-10-22 Linux虚拟机实测（采集提交 `53131b1`）：Ubuntu 22.04、Linux 6.8.0-138、GCC 11.4，
 8 vCPU VMware，Release `-O3 -DNDEBUG`、sanitizer/failpoint OFF。64B、1P1C、每轮发布1000条、
-预热100个观察样本，100/1000Hz × 同/跨 vCPU × futex/eventfd × 3轮，共24轮串行采集。
-独立验证确认24轮发布/观察账本及数据完整性；16轮满足零跳样、900个测量样本及零跨发布排队的
-延迟比较条件。1000Hz下8轮出现 latest-value 合法序号跳跃，按观察计数保留原始记录。
+预热100个观察样本，100/1000Hz × 同/跨 vCPU × futex/eventfd/driver × 3轮，共36轮串行采集。
+driver 使用 UAPI 1 模块，vermagic 匹配运行内核。独立验证确认36轮数据完整性：36000次成功
+发布、35954次独立观察、46个 latest-value 合法覆盖序号；重复、校验错误及超时均为0。
+25轮满足零跳样、900个测量样本及零跨发布排队的延迟比较条件；1000Hz下其余11轮按原始
+计数保留。此前 `7063a03` 的24轮双后端数据及其16轮比较资格保持原采集归属。
 
 下表为100Hz全部合格配对的三轮 median [min–max]，计时为同机
 `CLOCK_MONOTONIC_RAW` 的 publish→observation，预热后 nearest-rank 分位数：
 
 | vCPU / 通知 | p50（µs） | p99（µs） |
 |---|---:|---:|
-| 0 / futex | 14.290 [13.787–14.325] | 50.050 [43.117–94.486] |
-| 0 / eventfd | 50.869 [48.419–53.555] | 117.062 [115.263–124.456] |
-| 0→1 / futex | 44.668 [43.510–48.016] | 121.060 [109.982–137.944] |
-| 0→1 / eventfd | 80.104 [77.719–80.941] | 182.743 [173.776–196.446] |
+| 0 / futex | 15.150 [14.744–15.646] | 36.896 [36.673–43.097] |
+| 0 / eventfd | 56.035 [56.009–60.045] | 101.566 [95.870–101.923] |
+| 0 / driver | 59.796 [58.039–60.581] | 119.808 [101.946–119.937] |
+| 0→1 / futex | 65.812 [59.320–72.616] | 216.589 [161.233–230.174] |
+| 0→1 / eventfd | 102.532 [95.214–110.759] | 251.430 [249.095–277.717] |
+| 0→1 / driver | 106.237 [101.090–107.144] | 232.913 [198.276–233.837] |
 
 本批同条件下 futex 的延迟和 CPU 更低；FD 通知提供接入 epoll/Asio 统一事件循环的能力。
 同批真实 vcan 使用专属临时 user/network namespace：正常/256帧突发、每组2秒、新旧安装
 入口各两组，Release 4组及 ASan/UBSan 4组完成，记录各事件计数、最大处理间隔和停止时延。
 另一次502.1ms业务空闲窗口中，timerfd继续运行，consumer占用0.608ms进程CPU（0.121%），
 consumer为1线程、producer含控制服务共2线程。CPU通过同UID进程的POSIX CPU clock读取。
-持续可读饱和、stop多源同时就绪和混合循环内producer退出场景继续按独立用例验收；驱动实测
-及调试内核验证随设备与权限准备后进行。
+补充的持续可读饱和、公平有界批次、stop四源同时就绪及producer退出最终样本用例，已在
+Release与ASan/UBSan完成验证。真实驱动probe、Debug与ASan/UBSan各8项跨进程测试、
+两套搬移安装的新旧通知/协程入口共8组完成；KASAN/lockdep运行验收待对应配置的调试内核。
 
 ```bash
 python3 -B scripts/run_notification_matrix.py --binary-dir build/selfipcs-release/tools \
