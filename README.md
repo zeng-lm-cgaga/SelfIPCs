@@ -260,6 +260,8 @@ python3 scripts/prepare_notification_service.py --user selfipcs-demo \
 `udevadm control --reload-rules`、`udevadm trigger --action=add /sys/class/misc/self_ipcs_notification`、
 `systemctl daemon-reload` 和 `systemctl start self-ipcs-notification.service`。
 服务以指定普通账号和补充设备组运行，设备缺失 `ENOENT`、权限不足 `EACCES` 保留原 errno。
+服务沙箱使用 `ProtectHome=tmpfs` 隔离用户目录，并通过 `BindPaths` 仅映射该账号的
+`/run/user/<uid>`，供通道控制锁与通知 socket 使用；根文件系统保持只读保护。
 结束时先停止服务、关闭全部设备引用，再正常卸载模块；撤销配置后重新加载规则、服务配置，
 由管理员恢复设备 `root:root 0600`。运行目录的 UID、属主和 `0700` 同通道创建账号一致。
 

@@ -34,6 +34,11 @@ class NotificationServiceTest(unittest.TestCase):
             self.assertIn("SupplementaryGroups=ipc-notify", service)
             self.assertIn("DevicePolicy=closed", service)
             self.assertIn("KillMode=control-group", service)
+            self.assertIn("ProtectHome=tmpfs\n", service)
+            self.assertIn("BindPaths=/run/user/2001\n", service)
+            self.assertIn("ProtectSystem=strict\n", service)
+            self.assertIn("ReadWritePaths=/dev/shm /run/user/2001\n", service)
+            self.assertNotIn("BindPaths=/run/user\n", service)
             self.assertNotIn("@", service)
             self.assertEqual((output / "self-ipcs-notification.conf").read_text(),
                              "d /run/user/2001 0700 ipc-service ipc-service -\n")
