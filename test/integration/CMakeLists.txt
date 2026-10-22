@@ -287,6 +287,12 @@ add_test(
   NAME shared_buffer_pool_er17
   COMMAND shared_buffer_pool_integration_test $<TARGET_FILE:edge_shared_buffer_pool_child>)
 set_tests_properties(shared_buffer_pool_er17 PROPERTIES TIMEOUT 120 LABELS integration)
+gtest_add_tests(
+  TARGET shared_buffer_pool_integration_test
+  SOURCES shared_buffer_pool_test.cpp
+  EXTRA_ARGS $<TARGET_FILE:edge_shared_buffer_pool_child>
+  TEST_LIST shared_buffer_pool_cases)
+set_tests_properties(${shared_buffer_pool_cases} PROPERTIES TIMEOUT 120 LABELS integration)
 
 add_executable(
 	consume_demo_cleanup_test

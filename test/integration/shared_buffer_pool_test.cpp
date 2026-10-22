@@ -1,4 +1,13 @@
+#include "edge_runtime/buffer/shared_buffer_pool.hpp"
+
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <poll.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <csignal>
@@ -8,19 +17,12 @@
 #include <string>
 #include <vector>
 
-#include <sys/mman.h>
-#include <poll.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#include "edge_runtime/queue/mpmc_layout.hpp"
 #include "edge_runtime/buffer/shared_buffer_pool_layout.hpp"
-#include "edge_runtime/transport/shm_object.hpp"
 #include "edge_runtime/common/error.hpp"
+#include "edge_runtime/queue/mpmc_layout.hpp"
 #include "edge_runtime/queue/mpmc_queue.hpp"
-#include "edge_runtime/buffer/shared_buffer_pool.hpp"
 #include "edge_runtime/sync/shared_atomic.hpp"
+#include "edge_runtime/transport/shm_object.hpp"
 #include "shared_buffer_pool_payload.hpp"
 #include "test_util.hpp"
 
@@ -31,9 +33,9 @@ using edge_runtime::BufferHandle;
 using edge_runtime::ErrorCode;
 using edge_runtime::SharedBufferPool;
 using edge_runtime::SharedBufferPoolOptions;
+using edge_runtime::detail::kSharedBufferPoolLegacyMagic;
 using edge_runtime::detail::SharedBufferBlockHeaderAbi;
 using edge_runtime::detail::SharedBufferPoolHeaderAbi;
-using edge_runtime::detail::kSharedBufferPoolLegacyMagic;
 
 std::string g_helper;
 
@@ -41,13 +43,35 @@ std::string pool_shm_name_for(const std::string& name) {
 	return "/edgeruntime.bufferpool." + std::to_string(getuid()) + "." + name;
 }
 
-class ScopedUnlink {
+class ScopedObjectEvidence {
        public:
-	explicit ScopedUnlink(std::string name) : name_(std::move(name)) {}
-	~ScopedUnlink() { (void)::shm_unlink(name_.c_str()); }
+	explicit ScopedObjectEvidence(std::string name) : name_(std::move(name)) {}
+	~ScopedObjectEvidence() {
+		const int descriptor =
+		        ::shm_open(name_.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+		if (descriptor < 0) {
+			std::printf("POOL_OBJECT_ABSENT name=%s errno=%d observer=%ld\n",
+			            name_.c_str(), errno, static_cast<long>(::getpid()));
+			return;
+		}
+		struct stat metadata {};
+		if (::fstat(descriptor, &metadata) == 0) {
+			std::printf(
+			        "POOL_OBJECT_PRESERVED name=%s dev=%llu inode=%llu size=%lld "
+			        "observer=%ld\n",
+			        name_.c_str(), static_cast<unsigned long long>(metadata.st_dev),
+			        static_cast<unsigned long long>(metadata.st_ino),
+			        static_cast<long long>(metadata.st_size),
+			        static_cast<long>(::getpid()));
+		} else {
+			std::printf("POOL_OBJECT_INSPECTION_FAILED name=%s errno=%d observer=%ld\n",
+			            name_.c_str(), errno, static_cast<long>(::getpid()));
+		}
+		::close(descriptor);
+	}
 
-	ScopedUnlink(const ScopedUnlink&) = delete;
-	ScopedUnlink& operator=(const ScopedUnlink&) = delete;
+	ScopedObjectEvidence(const ScopedObjectEvidence&) = delete;
+	ScopedObjectEvidence& operator=(const ScopedObjectEvidence&) = delete;
 
        private:
 	std::string name_;
@@ -129,8 +153,8 @@ std::string kill_and_reap(edge_test::SpawnedChild* child) {
 	return output;
 }
 
-bool spawn_with_failpoint(edge_test::SpawnedChild* child,
-                          const std::vector<std::string>& args, const char* failpoint) {
+bool spawn_with_failpoint(edge_test::SpawnedChild* child, const std::vector<std::string>& args,
+                          const char* failpoint) {
 	::setenv("EDGE_FAILPOINT", failpoint, 1);
 	::setenv("EDGE_FAILPOINT_MODE", "stop", 1);
 	const bool spawned = child->spawn(args);
@@ -151,7 +175,9 @@ bool wait_for_pipe_token(int fd, const char* token, int timeout_ms) {
 		if (received.find(token) != std::string::npos) return true;
 		const int64_t remaining = deadline - edge_test::monotonic_ms_now();
 		if (remaining <= 0) return false;
-		struct pollfd descriptor {fd, POLLIN, 0};
+		struct pollfd descriptor {
+			fd, POLLIN, 0
+		};
 		const int rc = ::poll(&descriptor, 1, static_cast<int>(remaining));
 		if (rc < 0 && errno == EINTR) continue;
 		if (rc <= 0) return false;
@@ -169,47 +195,46 @@ bool wait_for_pipe_token(int fd, const char* token, int timeout_ms) {
 std::vector<std::string> crash_reader_args(const std::string& pool_name,
                                            const BufferHandle& handle) {
 	auto args = child_args("crash-reader", pool_name);
-	args.insert(args.end(), {"--pool-generation", std::to_string(handle.pool_generation),
-	                         "--block-generation", std::to_string(handle.block_generation),
-	                         "--nonce-hi", std::to_string(handle.instance_nonce_hi),
-	                         "--nonce-lo", std::to_string(handle.instance_nonce_lo),
-	                         "--offset", std::to_string(handle.offset),
-	                         "--block-id", std::to_string(handle.block_id),
-	                         "--length", std::to_string(handle.length)});
+	args.insert(args.end(),
+	            {"--pool-generation", std::to_string(handle.pool_generation),
+	             "--block-generation", std::to_string(handle.block_generation), "--nonce-hi",
+	             std::to_string(handle.instance_nonce_hi), "--nonce-lo",
+	             std::to_string(handle.instance_nonce_lo), "--offset",
+	             std::to_string(handle.offset), "--block-id", std::to_string(handle.block_id),
+	             "--length", std::to_string(handle.length)});
 	return args;
 }
 
 std::vector<std::string> stale_reader_args(const std::string& pool_name,
                                            const BufferHandle& handle) {
 	auto args = child_args("stale-reader", pool_name);
-	args.insert(args.end(), {"--pool-generation", std::to_string(handle.pool_generation),
-	                         "--block-generation", std::to_string(handle.block_generation),
-	                         "--nonce-hi", std::to_string(handle.instance_nonce_hi),
-	                         "--nonce-lo", std::to_string(handle.instance_nonce_lo),
-	                         "--offset", std::to_string(handle.offset),
-	                         "--block-id", std::to_string(handle.block_id),
-	                         "--length", std::to_string(handle.length)});
+	args.insert(args.end(),
+	            {"--pool-generation", std::to_string(handle.pool_generation),
+	             "--block-generation", std::to_string(handle.block_generation), "--nonce-hi",
+	             std::to_string(handle.instance_nonce_hi), "--nonce-lo",
+	             std::to_string(handle.instance_nonce_lo), "--offset",
+	             std::to_string(handle.offset), "--block-id", std::to_string(handle.block_id),
+	             "--length", std::to_string(handle.length)});
 	return args;
 }
 
-std::vector<std::string> recycle_args(const std::string& pool_name,
-                                      const BufferHandle& handle) {
+std::vector<std::string> recycle_args(const std::string& pool_name, const BufferHandle& handle) {
 	auto args = child_args("recycle", pool_name);
-	args.insert(args.end(), {"--pool-generation", std::to_string(handle.pool_generation),
-	                         "--block-generation", std::to_string(handle.block_generation),
-	                         "--nonce-hi", std::to_string(handle.instance_nonce_hi),
-	                         "--nonce-lo", std::to_string(handle.instance_nonce_lo),
-	                         "--offset", std::to_string(handle.offset),
-	                         "--block-id", std::to_string(handle.block_id),
-	                         "--length", std::to_string(handle.length)});
+	args.insert(args.end(),
+	            {"--pool-generation", std::to_string(handle.pool_generation),
+	             "--block-generation", std::to_string(handle.block_generation), "--nonce-hi",
+	             std::to_string(handle.instance_nonce_hi), "--nonce-lo",
+	             std::to_string(handle.instance_nonce_lo), "--offset",
+	             std::to_string(handle.offset), "--block-id", std::to_string(handle.block_id),
+	             "--length", std::to_string(handle.length)});
 	return args;
 }
 
 TEST(SharedBufferPoolIntegration, QueueDescriptorChainAndBlockReuse) {
 	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_chain");
 	const std::string queue_name = edge_test::unique_channel_name("buffer_handle_queue");
-	ScopedUnlink pool_cleanup(pool_shm_name_for(pool_name));
-	ScopedUnlink queue_cleanup(edge_runtime::detail::mpmc_shm_name(queue_name));
+	ScopedObjectEvidence pool_cleanup(pool_shm_name_for(pool_name));
+	ScopedObjectEvidence queue_cleanup(edge_runtime::detail::mpmc_shm_name(queue_name));
 
 	auto queue = Queue::create(queue_options(queue_name), SharedBufferHandleQueueSchema());
 	ASSERT_TRUE(queue) << edge_runtime::to_string(queue.error().code) << " "
@@ -233,6 +258,7 @@ TEST(SharedBufferPoolIntegration, QueueDescriptorChainAndBlockReuse) {
 	EXPECT_NE(producer_output.find("PRODUCED count=8 generations=8"), std::string::npos);
 	EXPECT_NE(consumer_output.find("CONSUMED count=8 generations=8"), std::string::npos);
 
+	if (::testing::Test::HasFailure()) return;
 	auto removed = queue.value().remove_if_creator();
 	ASSERT_TRUE(removed) << edge_runtime::to_string(removed.error().code) << " "
 	                     << removed.error().context;
@@ -240,7 +266,7 @@ TEST(SharedBufferPoolIntegration, QueueDescriptorChainAndBlockReuse) {
 
 TEST(SharedBufferPoolIntegration, StatusCountsObservedReadingRoleAfterPublish) {
 	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_status_reading");
-	ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+	ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 	auto pool = SharedBufferPool::create(pool_options(pool_name));
 	ASSERT_TRUE(pool);
 
@@ -249,9 +275,8 @@ TEST(SharedBufferPoolIntegration, StatusCountsObservedReadingRoleAfterPublish) {
 	std::memset(write.value().data(), 0x4A, write.value().size());
 
 	edge_test::SpawnedChild observer;
-	ASSERT_TRUE(spawn_with_failpoint(
-	        &observer, status_args(pool_name),
-	        "SHARED_BUFFER_POOL_OWNER_SNAPSHOT_AFTER_STATE1"));
+	ASSERT_TRUE(spawn_with_failpoint(&observer, status_args(pool_name),
+	                                 "SHARED_BUFFER_POOL_OWNER_SNAPSHOT_AFTER_STATE1"));
 	ASSERT_TRUE(wait_stopped(observer.pid(), 5000));
 
 	auto published = write.value().publish();
@@ -274,7 +299,7 @@ TEST(SharedBufferPoolIntegration, StatusCountsObservedReadingRoleAfterPublish) {
 
 TEST(SharedBufferPoolIntegration, StatusCountsObservedWritingRoleAfterReadRelease) {
 	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_status_writing");
-	ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+	ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 	auto pool = SharedBufferPool::create(pool_options(pool_name));
 	ASSERT_TRUE(pool);
 
@@ -287,9 +312,8 @@ TEST(SharedBufferPoolIntegration, StatusCountsObservedWritingRoleAfterReadReleas
 	ASSERT_TRUE(read);
 
 	edge_test::SpawnedChild observer;
-	ASSERT_TRUE(spawn_with_failpoint(
-	        &observer, status_args(pool_name),
-	        "SHARED_BUFFER_POOL_OWNER_SNAPSHOT_AFTER_STATE1"));
+	ASSERT_TRUE(spawn_with_failpoint(&observer, status_args(pool_name),
+	                                 "SHARED_BUFFER_POOL_OWNER_SNAPSHOT_AFTER_STATE1"));
 	ASSERT_TRUE(wait_stopped(observer.pid(), 5000));
 
 	read.value().release();
@@ -303,13 +327,18 @@ TEST(SharedBufferPoolIntegration, StatusCountsObservedWritingRoleAfterReadReleas
 	          std::string::npos)
 	        << observer_output;
 	replacement.value().abort();
+	if (!::testing::Test::HasFailure()) {
+		ASSERT_TRUE(pool.value().remove_if_creator());
+	}
 }
 
 TEST(SharedBufferPoolIntegration, ChainProducerRetriesStatusContentionDuringReaderClaim) {
-	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_chain_contention");
-	const std::string queue_name = edge_test::unique_channel_name("buffer_handle_chain_contention");
-	ScopedUnlink pool_cleanup(pool_shm_name_for(pool_name));
-	ScopedUnlink queue_cleanup(edge_runtime::detail::mpmc_shm_name(queue_name));
+	const std::string pool_name =
+	        edge_test::unique_channel_name("buffer_pool_chain_contention");
+	const std::string queue_name =
+	        edge_test::unique_channel_name("buffer_handle_chain_contention");
+	ScopedObjectEvidence pool_cleanup(pool_shm_name_for(pool_name));
+	ScopedObjectEvidence queue_cleanup(edge_runtime::detail::mpmc_shm_name(queue_name));
 
 	auto queue = Queue::create(queue_options(queue_name), SharedBufferHandleQueueSchema());
 	ASSERT_TRUE(queue) << edge_runtime::to_string(queue.error().code) << " "
@@ -319,9 +348,9 @@ TEST(SharedBufferPoolIntegration, ChainProducerRetriesStatusContentionDuringRead
 	int status_pipe[2] = {-1, -1};
 	ASSERT_EQ(::pipe(status_pipe), 0);
 	auto producer_args = child_args("producer", pool_name);
-	producer_args.insert(producer_args.end(), {"--queue-name", queue_name, "--count", "1",
-	                                             "--status-event-fd",
-	                                             std::to_string(status_pipe[1])});
+	producer_args.insert(producer_args.end(),
+	                     {"--queue-name", queue_name, "--count", "1", "--status-event-fd",
+	                      std::to_string(status_pipe[1])});
 	ASSERT_TRUE(producer.spawn(producer_args));
 	::close(status_pipe[1]);
 	status_pipe[1] = -1;
@@ -329,8 +358,8 @@ TEST(SharedBufferPoolIntegration, ChainProducerRetriesStatusContentionDuringRead
 	edge_test::SpawnedChild consumer;
 	auto consumer_args = child_args("consumer", pool_name);
 	consumer_args.insert(consumer_args.end(), {"--queue-name", queue_name, "--count", "1"});
-	ASSERT_TRUE(spawn_with_failpoint(
-	        &consumer, consumer_args, "SHARED_BUFFER_POOL_READ_OWNER_EPOCH_ODD"));
+	ASSERT_TRUE(spawn_with_failpoint(&consumer, consumer_args,
+	                                 "SHARED_BUFFER_POOL_READ_OWNER_EPOCH_ODD"));
 	ASSERT_TRUE(wait_stopped(consumer.pid(), 5000));
 	ASSERT_TRUE(wait_for_pipe_token(status_pipe[0], "POOL_STATUS_CONTENTION\n", 30000));
 	EXPECT_TRUE(process_is_running(producer.pid()));
@@ -348,9 +377,9 @@ TEST(SharedBufferPoolIntegration, ChainProducerRetriesStatusContentionDuringRead
 	EXPECT_EQ(producer.exit_code(), 0) << producer_output;
 	EXPECT_NE(producer_output.find("PRODUCED count=1 generations=1"), std::string::npos)
 	        << producer_output;
-	EXPECT_EQ(producer_output.find("POOL_STATUS_FAIL"), std::string::npos)
-	        << producer_output;
+	EXPECT_EQ(producer_output.find("POOL_STATUS_FAIL"), std::string::npos) << producer_output;
 
+	if (::testing::Test::HasFailure()) return;
 	auto removed = queue.value().remove_if_creator();
 	ASSERT_TRUE(removed) << edge_runtime::to_string(removed.error().code) << " "
 	                     << removed.error().context;
@@ -358,26 +387,27 @@ TEST(SharedBufferPoolIntegration, ChainProducerRetriesStatusContentionDuringRead
 
 TEST(SharedBufferPoolIntegration, SchemaAndAbiMismatchFailClosed) {
 	const std::string schema_name = edge_test::unique_channel_name("buffer_pool_schema");
-	ScopedUnlink schema_cleanup(pool_shm_name_for(schema_name));
+	ScopedObjectEvidence schema_cleanup(pool_shm_name_for(schema_name));
 	auto schema_pool = SharedBufferPool::create(pool_options(schema_name));
 	ASSERT_TRUE(schema_pool);
 
-	auto mismatch = edge_test::run_child_capture(
-	        child_args("open-mismatch", schema_name), 10000);
+	auto mismatch =
+	        edge_test::run_child_capture(child_args("open-mismatch", schema_name), 10000);
 	ASSERT_FALSE(mismatch.timed_out);
 	EXPECT_EQ(mismatch.exit_code, 3) << mismatch.stdout_text;
 	EXPECT_NE(mismatch.stdout_text.find("OPEN_FAIL code=SchemaMismatch"), std::string::npos);
+	if (::testing::Test::HasFailure()) return;
 	ASSERT_TRUE(schema_pool.value().remove_if_creator());
 
 	const std::string abi_name = edge_test::unique_channel_name("buffer_pool_abi");
-	ScopedUnlink abi_cleanup(pool_shm_name_for(abi_name));
+	ScopedObjectEvidence abi_cleanup(pool_shm_name_for(abi_name));
 	auto abi_pool = SharedBufferPool::create(pool_options(abi_name));
 	ASSERT_TRUE(abi_pool);
 	const auto shm_name = pool_shm_name_for(abi_name);
 	auto fd = edge_runtime::detail::shm_open_existing(shm_name);
 	ASSERT_TRUE(fd);
-	auto mapping = edge_runtime::detail::mmap_region(
-	        fd.value(), sizeof(SharedBufferPoolHeaderAbi));
+	auto mapping =
+	        edge_runtime::detail::mmap_region(fd.value(), sizeof(SharedBufferPoolHeaderAbi));
 	ASSERT_TRUE(mapping);
 	auto* header = static_cast<SharedBufferPoolHeaderAbi*>(mapping.value().get());
 	header->abi_major = 99;
@@ -388,19 +418,19 @@ TEST(SharedBufferPoolIntegration, SchemaAndAbiMismatchFailClosed) {
 	ASSERT_FALSE(abi.timed_out);
 	EXPECT_EQ(abi.exit_code, 3) << abi.stdout_text;
 	EXPECT_NE(abi.stdout_text.find("OPEN_FAIL code=AbiMismatch"), std::string::npos);
+	if (::testing::Test::HasFailure()) return;
 	ASSERT_TRUE(abi_pool.value().remove_if_creator());
 
 	const std::string legacy_name = edge_test::unique_channel_name("buffer_pool_legacy_magic");
-	ScopedUnlink legacy_cleanup(pool_shm_name_for(legacy_name));
+	ScopedObjectEvidence legacy_cleanup(pool_shm_name_for(legacy_name));
 	auto legacy_pool = SharedBufferPool::create(pool_options(legacy_name));
 	ASSERT_TRUE(legacy_pool);
 	auto legacy_fd = edge_runtime::detail::shm_open_existing(pool_shm_name_for(legacy_name));
 	ASSERT_TRUE(legacy_fd);
-	auto legacy_mapping = edge_runtime::detail::mmap_region(
-	        legacy_fd.value(), sizeof(SharedBufferPoolHeaderAbi));
+	auto legacy_mapping = edge_runtime::detail::mmap_region(legacy_fd.value(),
+	                                                        sizeof(SharedBufferPoolHeaderAbi));
 	ASSERT_TRUE(legacy_mapping);
-	auto* legacy_header =
-	        static_cast<SharedBufferPoolHeaderAbi*>(legacy_mapping.value().get());
+	auto* legacy_header = static_cast<SharedBufferPoolHeaderAbi*>(legacy_mapping.value().get());
 	std::memcpy(legacy_header->magic, kSharedBufferPoolLegacyMagic,
 	            sizeof(legacy_header->magic));
 	legacy_mapping.value().reset();
@@ -410,12 +440,13 @@ TEST(SharedBufferPoolIntegration, SchemaAndAbiMismatchFailClosed) {
 	ASSERT_FALSE(legacy.timed_out);
 	EXPECT_EQ(legacy.exit_code, 3) << legacy.stdout_text;
 	EXPECT_NE(legacy.stdout_text.find("OPEN_FAIL code=AbiMismatch"), std::string::npos);
+	if (::testing::Test::HasFailure()) return;
 	ASSERT_TRUE(legacy_pool.value().remove_if_creator());
 }
 
 TEST(SharedBufferPoolIntegration, DeadWriterFailsClosed) {
 	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_dead_writer");
-	ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+	ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 	auto pool = SharedBufferPool::create(pool_options(pool_name));
 	ASSERT_TRUE(pool);
 
@@ -438,7 +469,7 @@ TEST(SharedBufferPoolIntegration, DeadWriterFailsClosed) {
 
 TEST(SharedBufferPoolIntegration, DeadReaderFailsClosed) {
 	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_dead_reader");
-	ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+	ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 	auto pool = SharedBufferPool::create(pool_options(pool_name));
 	ASSERT_TRUE(pool);
 	auto write = pool.value().try_acquire_write();
@@ -470,14 +501,15 @@ TEST(SharedBufferPoolIntegration, OwnerClaimWindowsAreContentionUntilCommit) {
 	        "SHARED_BUFFER_POOL_WRITE_OWNER_EPOCH_COMMITTED",
 	};
 	for (const char* failpoint : writer_failpoints) {
-		const std::string pool_name = edge_test::unique_channel_name("buffer_pool_writer_epoch");
-		ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+		const std::string pool_name =
+		        edge_test::unique_channel_name("buffer_pool_writer_epoch");
+		ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 		auto pool = SharedBufferPool::create(pool_options(pool_name));
 		ASSERT_TRUE(pool);
 
 		edge_test::SpawnedChild victim;
-		ASSERT_TRUE(spawn_with_failpoint(
-		        &victim, child_args("crash-writer", pool_name), failpoint));
+		ASSERT_TRUE(spawn_with_failpoint(&victim, child_args("crash-writer", pool_name),
+		                                 failpoint));
 		ASSERT_TRUE(wait_stopped(victim.pid(), 5000));
 
 		const auto status = edge_test::run_child_capture(status_args(pool_name), 10000);
@@ -495,8 +527,9 @@ TEST(SharedBufferPoolIntegration, OwnerClaimWindowsAreContentionUntilCommit) {
 	        "SHARED_BUFFER_POOL_READ_OWNER_EPOCH_COMMITTED",
 	};
 	for (const char* failpoint : reader_failpoints) {
-		const std::string pool_name = edge_test::unique_channel_name("buffer_pool_reader_epoch");
-		ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+		const std::string pool_name =
+		        edge_test::unique_channel_name("buffer_pool_reader_epoch");
+		ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 		auto pool = SharedBufferPool::create(pool_options(pool_name));
 		ASSERT_TRUE(pool);
 		auto write = pool.value().try_acquire_write();
@@ -527,8 +560,9 @@ TEST(SharedBufferPoolIntegration, SnapshotAcceptsCompleteOwnerAfterInactiveRepla
 	        "SHARED_BUFFER_POOL_OWNER_SNAPSHOT_AFTER_EPOCH1",
 	};
 	for (const char* failpoint : snapshot_failpoints) {
-		const std::string pool_name = edge_test::unique_channel_name("buffer_pool_owner_replace");
-		ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+		const std::string pool_name =
+		        edge_test::unique_channel_name("buffer_pool_owner_replace");
+		ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 		auto pool = SharedBufferPool::create(pool_options(pool_name));
 		ASSERT_TRUE(pool);
 		{
@@ -536,8 +570,8 @@ TEST(SharedBufferPoolIntegration, SnapshotAcceptsCompleteOwnerAfterInactiveRepla
 			ASSERT_TRUE(first);
 
 			edge_test::SpawnedChild observer;
-			ASSERT_TRUE(spawn_with_failpoint(
-			        &observer, status_args(pool_name), failpoint));
+			ASSERT_TRUE(
+			        spawn_with_failpoint(&observer, status_args(pool_name), failpoint));
 			ASSERT_TRUE(wait_stopped(observer.pid(), 5000));
 
 			first.value().abort();
@@ -559,8 +593,9 @@ TEST(SharedBufferPoolIntegration, SnapshotAcceptsCompleteOwnerAfterInactiveRepla
 }
 
 TEST(SharedBufferPoolIntegration, SnapshotSeesOddReplacementAsContention) {
-	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_owner_odd_replace");
-	ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+	const std::string pool_name =
+	        edge_test::unique_channel_name("buffer_pool_owner_odd_replace");
+	ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 	auto pool = SharedBufferPool::create(pool_options(pool_name));
 	ASSERT_TRUE(pool);
 	{
@@ -568,16 +603,15 @@ TEST(SharedBufferPoolIntegration, SnapshotSeesOddReplacementAsContention) {
 		ASSERT_TRUE(first);
 
 		edge_test::SpawnedChild observer;
-		ASSERT_TRUE(spawn_with_failpoint(
-		        &observer, status_args(pool_name),
-		        "SHARED_BUFFER_POOL_OWNER_SNAPSHOT_AFTER_STATE1"));
+		ASSERT_TRUE(spawn_with_failpoint(&observer, status_args(pool_name),
+		                                 "SHARED_BUFFER_POOL_OWNER_SNAPSHOT_AFTER_STATE1"));
 		ASSERT_TRUE(wait_stopped(observer.pid(), 5000));
 		first.value().abort();
 
 		edge_test::SpawnedChild replacement;
-		ASSERT_TRUE(spawn_with_failpoint(
-		        &replacement, child_args("crash-writer", pool_name),
-		        "SHARED_BUFFER_POOL_WRITE_OWNER_EPOCH_ODD"));
+		ASSERT_TRUE(spawn_with_failpoint(&replacement,
+		                                 child_args("crash-writer", pool_name),
+		                                 "SHARED_BUFFER_POOL_WRITE_OWNER_EPOCH_ODD"));
 		ASSERT_TRUE(wait_stopped(replacement.pid(), 5000));
 
 		std::string output;
@@ -592,13 +626,13 @@ TEST(SharedBufferPoolIntegration, SnapshotSeesOddReplacementAsContention) {
 
 TEST(SharedBufferPoolIntegration, WriterReservesReaderEpochAtBoundary) {
 	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_epoch_boundary");
-	ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+	ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 	auto pool = SharedBufferPool::create(pool_options(pool_name));
 	ASSERT_TRUE(pool);
 
 	uint64_t mapping_size = 0;
-	ASSERT_TRUE(edge_runtime::detail::shared_buffer_pool_mapping_size_for(4096, 1,
-	                                                                      &mapping_size));
+	ASSERT_TRUE(
+	        edge_runtime::detail::shared_buffer_pool_mapping_size_for(4096, 1, &mapping_size));
 	auto fd = edge_runtime::detail::shm_open_existing(pool_shm_name_for(pool_name));
 	ASSERT_TRUE(fd);
 	auto mapping = edge_runtime::detail::mmap_region(fd.value(), mapping_size);
@@ -633,7 +667,7 @@ TEST(SharedBufferPoolIntegration, WriterReservesReaderEpochAtBoundary) {
 
 TEST(SharedBufferPoolIntegration, StaleReaderCannotClaimRecycledGeneration) {
 	const std::string pool_name = edge_test::unique_channel_name("buffer_pool_generation_race");
-	ScopedUnlink cleanup(pool_shm_name_for(pool_name));
+	ScopedObjectEvidence cleanup(pool_shm_name_for(pool_name));
 	auto pool = SharedBufferPool::create(pool_options(pool_name));
 	ASSERT_TRUE(pool);
 
@@ -645,12 +679,12 @@ TEST(SharedBufferPoolIntegration, StaleReaderCannotClaimRecycledGeneration) {
 	const BufferHandle old_handle = old_published.value();
 
 	edge_test::SpawnedChild stale_reader;
-	ASSERT_TRUE(spawn_with_failpoint(
-	        &stale_reader, stale_reader_args(pool_name, old_handle),
-	        "SHARED_BUFFER_POOL_READ_GENERATION_CHECKED"));
+	ASSERT_TRUE(spawn_with_failpoint(&stale_reader, stale_reader_args(pool_name, old_handle),
+	                                 "SHARED_BUFFER_POOL_READ_GENERATION_CHECKED"));
 	ASSERT_TRUE(wait_stopped(stale_reader.pid(), 5000));
 
-	const auto recycled = edge_test::run_child_capture(recycle_args(pool_name, old_handle), 10000);
+	const auto recycled =
+	        edge_test::run_child_capture(recycle_args(pool_name, old_handle), 10000);
 	ASSERT_FALSE(recycled.timed_out) << recycled.stdout_text;
 	ASSERT_EQ(recycled.exit_code, 0) << recycled.stdout_text;
 	EXPECT_NE(recycled.stdout_text.find("RECYCLE_OK old_generation=1 new_generation=2"),
@@ -670,7 +704,7 @@ TEST(SharedBufferPoolIntegration, StaleReaderCannotClaimRecycledGeneration) {
 	new_handle.block_generation = old_handle.block_generation + 1;
 	auto read = pool.value().acquire_read(new_handle);
 	ASSERT_TRUE(read) << edge_runtime::to_string(read.error().code) << " "
-                  << read.error().context;
+	                  << read.error().context;
 	EXPECT_EQ(std::to_integer<unsigned int>(read.value().data()[0]), 0x22u);
 	read.value().release();
 
@@ -685,7 +719,9 @@ TEST(SharedBufferPoolIntegration, StaleReaderCannotClaimRecycledGeneration) {
 	                   << reuse.error().context;
 	EXPECT_EQ(reuse.value().handle().block_generation, old_handle.block_generation + 2);
 	reuse.value().abort();
-	ASSERT_TRUE(pool.value().remove_if_creator());
+	if (!::testing::Test::HasFailure()) {
+		ASSERT_TRUE(pool.value().remove_if_creator());
+	}
 }
 
 }  // namespace
