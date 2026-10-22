@@ -408,7 +408,7 @@ GitHub Actions 提供三条工作流：
 
 | 工作流 | 触发方式 | 验证与交付 |
 |---|---|---|
-| [ci](.github/workflows/ci.yml) | `main` push、PR、手动、每周一 | Ubuntu 22.04/24.04 上执行 Debug、ASan/UBSan、Release、安装包重定位消费、新旧 CMake 入口及源码包重建；手动默认及每周运行完整 C01–C23 崩溃矩阵 |
+| [ci](.github/workflows/ci.yml) | `main` 或 `linux-notification-20261021` push、PR、手动、每周一 | Ubuntu 22.04/24.04 上执行 Debug、ASan/UBSan、Release、安装包重定位消费、新旧 CMake 入口及源码包重建；候选分支 push、手动默认及每周运行完整 C01–C23 崩溃矩阵 |
 | [release](.github/workflows/release.yml) | 推送 `vX.Y.Z` 标签，或选定标签手动运行 | 校验 CMake 版本和 `main` 历史，复用完整 CI 和四组 benchmark，上传草稿、下载复核 SHA256 后公开 GitHub Release |
 | [benchmark](.github/workflows/benchmark.yml) | 手动、每周一 | Release 下串行采集 SPSC、MPMC、Pool、持续负载四组数据，独立验证配置、身份、交付和统计完整性 |
 
