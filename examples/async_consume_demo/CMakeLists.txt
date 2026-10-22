@@ -20,7 +20,8 @@ if(SELFIPCS_DEMO_USE_LEGACY)
 endif()
 target_compile_options(async_consume_demo PRIVATE
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
-if(SELFIPCS_DEMO_ENABLE_SANITIZERS)
+if(SELFIPCS_DEMO_ENABLE_SANITIZERS OR
+   (TARGET self_ipcs_async AND SELFIPCS_ENABLE_SANITIZERS))
   target_compile_options(async_consume_demo PRIVATE
     -fno-omit-frame-pointer -fsanitize=address,undefined)
   target_link_options(async_consume_demo PRIVATE

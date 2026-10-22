@@ -4,7 +4,9 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/post.hpp>
 #include <chrono>
+#include <atomic>
 #include <optional>
+#include <thread>
 
 #include "edge_runtime/channel/producer.hpp"
 #include "self_ipcs/async/consumer.hpp"
@@ -127,5 +129,30 @@ TEST_F(AsyncClose, LazyReadSurvivesMoveAndWrapperDestruction) {
 	EXPECT_EQ(tasks, 1);
 	auto reopened = edge_runtime::Consumer<TestPayloadV1>::open(options, TestPayloadV1Schema());
 	EXPECT_TRUE(reopened);
+}
+
+TEST_F(AsyncClose, ConcurrentCancelAndCloseOnTwoLoopThreadsCompleteOnce) {
+	int read_completed = 0;
+	std::atomic<int> tasks{0};
+	auto checked = [&tasks](std::exception_ptr error, bool success) {
+		EXPECT_FALSE(error);
+		EXPECT_TRUE(success);
+		tasks.fetch_add(1);
+	};
+	boost::asio::co_spawn(loop, finish_read(consumer->async_wait_latest(Clock::now() + 1s),
+	                                      &read_completed), checked);
+	loop.poll();
+	loop.restart();
+	std::thread cancel([&] { consumer->cancel(); });
+	std::thread close([&] { consumer->close(); });
+	cancel.join();
+	close.join();
+	for (int index = 0; index < 3; ++index)
+		boost::asio::co_spawn(loop, finish_close(&*consumer, &read_completed), checked);
+	std::thread worker([&] { loop.run(); });
+	loop.run();
+	worker.join();
+	EXPECT_EQ(read_completed, 1);
+	EXPECT_EQ(tasks.load(), 4);
 }
 }

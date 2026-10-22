@@ -34,7 +34,8 @@ edgeruntime_unit_test(queue_feature_test PROPERTIES TIMEOUT 10)
 edgeruntime_unit_test(pool_wait_feature_test PROPERTIES TIMEOUT 10)
 edgeruntime_unit_test(pool_mapping_lifetime_test PROPERTIES TIMEOUT 8)
 target_link_options(pool_mapping_lifetime_test PRIVATE
-  "LINKER:--wrap=_ZN12edge_runtime6detail10futex_waitEPKvjPK8timespec")
+  "LINKER:--wrap=_ZN12edge_runtime6detail10futex_waitEPKvjPK8timespec"
+  "LINKER:--wrap=_ZN12edge_runtime6detail14probe_livenessEmm")
 edgeruntime_unit_test(pool_queue_test PROPERTIES TIMEOUT 8)
 target_link_options(pool_queue_test PRIVATE
   "LINKER:--wrap=_ZN12edge_runtime6detail17failpoint_triggerEPKNS0_15FailpointRecordE")

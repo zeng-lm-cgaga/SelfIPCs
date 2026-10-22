@@ -70,7 +70,11 @@ class MappingUse {
 	bool entered_{false};
 };
 
-Error mapping_unavailable() noexcept {
+Error mapping_unavailable(const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
+	if (handle && static_cast<uint64_t>(::getpid()) != handle->self.pid) {
+		return make_error(ErrorCode::kRecoveryBlocked, "SharedBufferPool",
+		                  "pool handle inherited across fork; reopen in this process");
+	}
 	return make_error(ErrorCode::kBufferPoolContention, "SharedBufferPool",
 	                  "local mapping removal in progress");
 }
@@ -577,7 +581,7 @@ Result<WriteBuffer> shared_buffer_pool_try_acquire_write_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
 	MappingUse use(handle);
 	if (!use)
-		return handle ? mapping_unavailable()
+		return handle ? mapping_unavailable(handle)
 		              : make_error(ErrorCode::kStaleHandle,
 		                           "SharedBufferPool::try_acquire_write", "empty handle");
 	if (handle) handle->diagnostics.add(DiagnosticCounter::kAcquireAttempts);
@@ -720,7 +724,7 @@ Result<WriteBuffer> shared_buffer_pool_wait_acquire_write_until_impl(
         std::chrono::steady_clock::time_point deadline, const CancellationToken& token) noexcept {
 	MappingUse use(handle);
 	if (!use)
-		return handle ? mapping_unavailable()
+		return handle ? mapping_unavailable(handle)
 		              : make_error(ErrorCode::kStaleHandle,
 		                           "SharedBufferPool::wait_acquire_write_until",
 		                           "empty handle");
@@ -849,7 +853,7 @@ Result<ReadBuffer> shared_buffer_pool_acquire_read_impl(
         const BufferHandle& descriptor) noexcept {
 	MappingUse use(handle);
 	if (!use)
-		return handle ? mapping_unavailable()
+		return handle ? mapping_unavailable(handle)
 		              : make_error(ErrorCode::kStaleHandle,
 		                           "SharedBufferPool::acquire_read", "empty handle");
 	auto valid = validate_descriptor(handle, descriptor, "SharedBufferPool::acquire_read");
@@ -984,7 +988,7 @@ Result<SharedBufferPoolStatus> shared_buffer_pool_status_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
 	MappingUse use(handle);
 	if (!use)
-		return handle ? mapping_unavailable()
+		return handle ? mapping_unavailable(handle)
 		              : make_error(ErrorCode::kStaleHandle, "SharedBufferPool::status",
 		                           "empty handle");
 	auto valid = validate_live_pool(handle, "SharedBufferPool::status");
@@ -1084,7 +1088,7 @@ Result<void> shared_buffer_pool_remove_if_creator_impl(
         const std::shared_ptr<SharedBufferPoolHandle>& handle) noexcept {
 	MappingRemoval removal(handle.get());
 	if (!removal)
-		return handle ? mapping_unavailable()
+		return handle ? mapping_unavailable(handle)
 		              : make_error(ErrorCode::kStaleHandle,
 		                           "SharedBufferPool::remove_if_creator", "empty handle");
 	auto valid = validate_live_pool(handle, "SharedBufferPool::remove_if_creator");

@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "edge_runtime/buffer/shared_buffer_pool.hpp"
+#include "edge_runtime/process/process_identity.hpp"
 #include "edge_runtime/sync/futex.hpp"
 #include "shared_buffer_pool_payload.hpp"
 #include "test_util.hpp"
@@ -19,6 +20,7 @@ std::condition_variable gate_condition;
 bool armed = false;
 bool arrived = false;
 bool released = false;
+bool probe_armed = false;
 
 edge_runtime::SharedBufferPoolOptions options() {
 	return {edge_test::unique_channel_name("pool_mapping"), 4096, 1,
@@ -44,6 +46,54 @@ extern "C" int __wrap__ZN12edge_runtime6detail10futex_waitEPKvjPK8timespec(
 	}
 	return __real__ZN12edge_runtime6detail10futex_waitEPKvjPK8timespec(address, expected,
 	                                                                   timeout);
+}
+
+extern "C" edge_runtime::detail::Liveness __real__ZN12edge_runtime6detail14probe_livenessEmm(
+        uint64_t, uint64_t) noexcept;
+extern "C" edge_runtime::detail::Liveness __wrap__ZN12edge_runtime6detail14probe_livenessEmm(
+        uint64_t process, uint64_t start) noexcept {
+	{
+		std::unique_lock<std::mutex> lock(gate_mutex);
+		if (probe_armed) {
+			probe_armed = false;
+			arrived = true;
+			gate_condition.notify_all();
+			(void)gate_condition.wait_for(lock, 2s, [] { return released; });
+		}
+	}
+	return __real__ZN12edge_runtime6detail14probe_livenessEmm(process, start);
+}
+
+TEST(PoolMappingLifetime, StatusAndMetadataAccessRejectConcurrentRemoval) {
+	auto created = edge_runtime::SharedBufferPool::create(options());
+	ASSERT_TRUE(created);
+	auto& pool = created.value();
+	{
+		std::lock_guard<std::mutex> lock(gate_mutex);
+		probe_armed = true;
+		arrived = released = false;
+	}
+	std::optional<edge_runtime::Result<edge_runtime::SharedBufferPoolStatus>> observed;
+	std::thread observer([&] { observed.emplace(pool.status()); });
+	bool reached = false;
+	{
+		std::unique_lock<std::mutex> lock(gate_mutex);
+		reached = gate_condition.wait_for(lock, 1s, [] { return arrived; });
+	}
+	EXPECT_TRUE(reached);
+	EXPECT_EQ(pool.block_count(), 1u);
+	EXPECT_EQ(pool.block_size(), 4096u);
+	EXPECT_NE(pool.generation(), 0u);
+	EXPECT_FALSE(pool.remove_if_creator());
+	{
+		std::lock_guard<std::mutex> lock(gate_mutex);
+		released = true;
+	}
+	gate_condition.notify_all();
+	observer.join();
+	ASSERT_TRUE(observed);
+	EXPECT_TRUE(*observed);
+	EXPECT_TRUE(pool.remove_if_creator());
 }
 
 TEST(PoolMappingLifetime, WaitAndCancellationRegistrationRejectDeletionAfterLastReturn) {
