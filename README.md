@@ -309,8 +309,9 @@ python3 -B scripts/verify_notification_matrix.py \
 MPMC 和 SharedBufferPool 新建实例使用 **ABI 3.0**；新旧库在 `open` 时按 major 显式拒绝
 ABI 2.0/3.0 混用，返回 `AbiMismatch`。升级时先由原 creator 按所有权排空、释放并移除旧实例，
 再创建新实例。SPSC 布局、`BufferHandle` 的 88B 结构、共享对象命名和身份校验沿用现有契约。
-本开发分支暂沿 CMake `0.4.0` 包版本标记；ABI 3 及本分支新增能力按开发提交标识，历史已发布
-`v0.4.0` 的内容和验收记录保持原归属。正式打包时由维护者统一确定新版本与迁移清单。
+本分支使用 CMake/安装包 **0.5.0 本地候选版本**，对应 ABI 3、可选通知后端及 C++20 async 组件；
+具体实现与验收由源码提交和产物 SHA 标识。历史已发布 `v0.4.0` 及其 ABI 2 内容、下载产物和
+验收记录保留原归属。应用升级时按上述实例迁移顺序切换队列与 Pool。
 
 - **全局关闭**：仅队列 creator 进程的匹配身份可以调用 `close()`。关闭与 push 共用 enqueue gate：
   已获 gate 的 push 完整提交后，close 才能提交关闭；之后的 push 返回 `Closed`。close 遇到活动 gate
@@ -407,7 +408,8 @@ CI 保存 JUnit、执行日志及崩溃现场 14 天；benchmark 保存环境、
 
 发布产物包括 `SelfIPCs-X.Y.Z-linux-x86_64.tar.gz`、`SelfIPCs-X.Y.Z-source.tar.gz`、`release-manifest.json` 和 `SHA256SUMS`。预编译包基于 Ubuntu 22.04、GCC 11/glibc 2.35，包含静态库、公共头、CMake 包和工具。源码包按代码路径白名单生成，文档仅含 README。CD 负责库安装包分发，业务服务由使用该库的应用部署。
 
-从 [Releases](https://github.com/zeng-lm-cgaga/SelfIPCs/releases) 下载四个文件后执行：
+历史 `v0.4.0` 可从 [Releases](https://github.com/zeng-lm-cgaga/SelfIPCs/releases) 下载四个文件后执行；
+当前 0.5.0 候选按上文源码构建与安装命令集成：
 
 ```bash
 sha256sum -c SHA256SUMS
@@ -416,7 +418,8 @@ cmake -S /path/to/your/app -B build \
   -DCMAKE_PREFIX_PATH="$PWD/SelfIPCs-0.4.0-linux-x86_64"
 ```
 
-维护者在确认 `main` 和 `CMakeLists.txt` 版本后创建对应标签，例如 `git tag -a v0.4.0 -m 'SelfIPCs 0.4.0'`、`git push origin v0.4.0`。发布任务仅在全部验证通过后取得写权限；已有 Release 保持原样，重复发布会报错，上传或下载复核失败时保留草稿与日志。
+维护者在确认 `main`、`CMakeLists.txt` 版本和对应验收记录后，为发布版本创建对应标签。
+发布任务仅在全部验证通过后取得写权限；已有 Release 保持原样，重复发布会报错，上传或下载复核失败时保留草稿与日志。
 
 本地复用完整发布校验：`bash scripts/ci.sh --full --package --out-dir /absolute/path/to/fresh-audit`。打包使用干净 Git checkout 和独立新输出目录。
 
