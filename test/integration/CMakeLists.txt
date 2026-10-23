@@ -1,6 +1,24 @@
 # 集成测试必须通过独立可执行文件和 fork/exec 验证进程边界行为。
 
 find_package(Python3 QUIET COMPONENTS Interpreter)
+foreach(entry IN ITEMS canonical legacy)
+  add_executable(consumer_after_close_${entry}_peer helpers/consumer_after_close_peer.cpp)
+  edgeruntime_apply_project_options(consumer_after_close_${entry}_peer)
+  target_link_libraries(consumer_after_close_${entry}_peer PRIVATE self_ipcs)
+  target_include_directories(consumer_after_close_${entry}_peer PRIVATE ../fixtures)
+  if(entry STREQUAL "legacy")
+    target_compile_definitions(consumer_after_close_${entry}_peer PRIVATE USE_LEGACY=1)
+  endif()
+endforeach()
+add_executable(consumer_after_close_test consumer_after_close_test.cpp)
+edgeruntime_apply_project_options(consumer_after_close_test)
+target_link_libraries(consumer_after_close_test PRIVATE self_ipcs GTest::gtest_main)
+target_include_directories(consumer_after_close_test PRIVATE ../fixtures)
+target_compile_definitions(consumer_after_close_test PRIVATE
+  CONTROL_AFTER_CLOSE_CANONICAL_PEER="$<TARGET_FILE:consumer_after_close_canonical_peer>"
+  CONTROL_AFTER_CLOSE_LEGACY_PEER="$<TARGET_FILE:consumer_after_close_legacy_peer>")
+add_dependencies(consumer_after_close_test consumer_after_close_canonical_peer consumer_after_close_legacy_peer)
+gtest_discover_tests(consumer_after_close_test PROPERTIES TIMEOUT 15 LABELS integration)
 add_executable(control_lock_peer helpers/control_lock_peer.cpp)
 edgeruntime_apply_project_options(control_lock_peer)
 target_link_libraries(control_lock_peer PRIVATE self_ipcs)

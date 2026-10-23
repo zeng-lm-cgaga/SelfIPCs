@@ -430,6 +430,10 @@ Result<EventNotification> consumer_event_notification_impl(
 	if (!available) return available.error();
 	ConsumerUse use(*handle);
 	if (!use.acquired) return make_error(ErrorCode::kConcurrentHandleUse, kOperation);
+	if (handle->control_closed || handle->shutdown_pending.load(std::memory_order_acquire))
+		return make_error(ErrorCode::kClosed, kOperation, "consumer stopped or closed");
+	if (!handle->shm.mapping.get())
+		return make_error(ErrorCode::kStaleHandle, kOperation, "consumer mapping unavailable");
 	uint64_t timeout_ns = 0;
 	if (!checked_mul_u64(timeout_ms == 0 ? kFdBrokerSingleAttemptTimeoutMs : timeout_ms,
 	                     1'000'000, &timeout_ns))
