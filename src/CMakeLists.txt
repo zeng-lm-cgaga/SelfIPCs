@@ -7,6 +7,7 @@ add_library(self_ipcs STATIC
   edge_runtime/channel/event_notification.cpp
   edge_runtime/channel/notification_backend.cpp
   edge_runtime/channel/control_lock.cpp
+  edge_runtime/channel/control_context.cpp
   edge_runtime/channel/loan.cpp
   edge_runtime/channel/producer_impl.cpp
   edge_runtime/channel/slot_protocol.cpp

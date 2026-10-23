@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 
+#include "edge_runtime/channel/control_operation.hpp"
 #include "edge_runtime/utility/checksum.hpp"
 
 namespace edge_runtime::detail {
@@ -223,6 +224,8 @@ Result<void> pread_full(int fd, void* buf, size_t size, uint64_t offset) noexcep
 	auto* dst = static_cast<char*>(buf);
 	size_t got = 0;
 	while (got < size) {
+		auto available = control_check();
+		if (!available) return available;
 		const ssize_t n =
 		        ::pread(fd, dst + got, size - got, static_cast<off_t>(offset + got));
 		if (n < 0) {
@@ -243,6 +246,8 @@ Result<void> pwrite_full(int fd, const void* buf, size_t size, uint64_t offset) 
 	const auto* src = static_cast<const char*>(buf);
 	size_t written = 0;
 	while (written < size) {
+		auto available = control_check();
+		if (!available) return available;
 		const ssize_t n = ::pwrite(fd, src + written, size - written,
 		                           static_cast<off_t>(offset + written));
 		if (n < 0) {
@@ -250,6 +255,7 @@ Result<void> pwrite_full(int fd, const void* buf, size_t size, uint64_t offset) 
 			const int e = errno;
 			return make_errno_error(e, "pwrite_full", std::strerror(e));
 		}
+		if (n == 0) return make_errno_error(EIO, "pwrite_full", "zero write");
 		written += static_cast<size_t>(n);
 	}
 	return Result<void>::ok();

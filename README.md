@@ -48,6 +48,45 @@ target_link_libraries(app PRIVATE SelfIPCs::self_ipcs)
 公共头使用 `self_ipcs/...`，例如 `#include <self_ipcs/queue/mpmc_queue.hpp>`。
 通道控制文件使用 `/run/user/<uid>/edgeruntime/`；服务或 CI 环境需准备当前 UID 所有、权限为 `0700` 的 `/run/user/<uid>`。
 
+### 通道控制期限与取消（源码 0.5.1）
+
+新接口使用 C++17，保留旧 API 与默认 futex 数据等待。显式要求该能力时使用
+`find_package(SelfIPCs 0.5.1 CONFIG REQUIRED COMPONENTS control_context)`，包含
+`self_ipcs/channel/control_context.hpp`，并调用库符号 `control_context_feature_version()`
+检查 `kControlContextFeatureVersion`；新头配旧库将链接失败，不静默降级。
+
+```cpp
+self_ipcs::CancellationSource stop;
+auto context = self_ipcs::ControlOperationContext::after(std::chrono::seconds(2), stop.token());
+self_ipcs::ControlReceipt receipt;
+auto producer = self_ipcs::Producer<Command>::create(options, schema, context.value(), receipt);
+```
+
+同一 `context` 可传入 `create/open/reconnect`、通知启停/注册、`remove_if_owner` 和显式
+`close/finalize`。锁重试、broker I/O 与失败清理共用同一个 **MONOTONIC 绝对期限**，不逐阶段重置。
+其他普通线程可调用 `stop.request_cancel()`，重复请求安全；取消使用粘性唤醒 FD，FD 不可用时控制等待按有界轮询复查。
+
+| 结果 | 提交与清理责任 |
+|---|---|
+| `Timeout/Cancelled`、`committed=false` | 新建/角色注册尚未提交；仍须检查 `cleanup_owner` |
+| 成功、`committed=true` | 已交付实例/角色或完成删除；迟到取消不撤销成功，观察 `deadline_elapsed/cancellation_observed` |
+| `cleanup_owner=kReceipt` | move-only `receipt` 唯一持有失败事务；`has_pending_cleanup()` 为真，用新预算显式 `receipt.finalize(context)` 继续 |
+| `cleanup_owner=kHandle` / `kPending` | 原句柄仍负责停止/清理；保持存活，owner 串行重试对应 `disable_event_notifications` 或 `finalize`；诊断见 `cleanup_error` 或返回错误 |
+
+创建以 READY 发布、打开/重连以消费者 ONLINE 角色发布、通知启用以服务线程交付、注册以本地已验证注册交付、删除以名称移除为提交点。
+重连成功及消费者收束会关闭旧通知注册；旧通知对象不会重新进入新实例的 watch。
+
+关闭采用两阶段：任意普通线程可 `request_stop()`，拒绝该句柄新工作并唤醒等待；owner 调用
+`finalize(context, receipt)`（或 `close`，先请求停止）确认借用已归还、服务线程退出、通知/FD/映射收束。
+`kPending` 不表示已经 join；后续使用新预算继续。需要删除名称时，可按 `request_stop` → `remove_if_owner` → `finalize` 收束；
+`close` 不隐式删除 POSIX 名称，完成 finalize 后不能再用已释放映射删除。
+同一句柄的其余操作仍须串行；取消/停止请求方必须在句柄移动或销毁前结束。停止不可撤销，不能通过重连重新启用同一句柄。
+
+期限约束 SDK 主动等待，不是硬实时保证：`fdatasync`、文件系统/驱动同步调用、线程创建/join 和 Linux 调度不能被 token 强制中断。
+提交前复查后发生的同步调用可能迟到；已提交结果仍返回成功及 receipt，未完成回收保持 pending。
+日志损坏或身份变化会 fail-closed 保留责任，不能强制清理。legacy 析构仍可能同步等待；要求有界路径的应用应先完成显式收束。
+持有 receipt 清理计划时必须先 finalize 再销毁；违约销毁会 `std::terminate`，不隐式丢弃或后台分离清理。
+
 ## 示例
 
 | 示例 | 内容 |

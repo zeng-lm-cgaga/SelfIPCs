@@ -7,6 +7,11 @@
 
 namespace edge_runtime::detail {
 
+class CancellationAccess {
+       public:
+	static int native_handle(const CancellationToken& token) noexcept;
+};
+
 class CancellationRegistration {
        public:
 	CancellationRegistration(const CancellationToken& token, uint32_t* epoch) noexcept;

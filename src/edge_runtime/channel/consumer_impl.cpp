@@ -9,13 +9,15 @@
 #include <utility>
 
 #include "edge_runtime/channel/channel_abi.hpp"
+#include "edge_runtime/channel/control_operation.hpp"
+#include "edge_runtime/channel/slot_protocol.hpp"
+#include "edge_runtime/sync/cancellation.hpp"
+#include "edge_runtime/sync/clock.hpp"
+#include "edge_runtime/sync/futex.hpp"
+#include "edge_runtime/transport/fd_broker.hpp"
 #include "edge_runtime/utility/checked_math.hpp"
 #include "edge_runtime/utility/checksum.hpp"
-#include "edge_runtime/sync/clock.hpp"
 #include "edge_runtime/utility/failpoint.hpp"
-#include "edge_runtime/transport/fd_broker.hpp"
-#include "edge_runtime/sync/futex.hpp"
-#include "edge_runtime/channel/slot_protocol.hpp"
 
 namespace edge_runtime::detail {
 
@@ -42,6 +44,8 @@ Result<void> reclaim_dead_consumer_slots(std::byte* base, uint64_t old_role_epoc
 				return make_error(ErrorCode::kRecoveryBlocked, "Consumer::open",
 				                  "claiming slot epoch unknown");
 			}
+			auto available = control_check();
+			if (!available) return available;
 			slot_release_read(slot);
 		} else if (st == static_cast<uint32_t>(SlotState::kReading)) {
 			const uint64_t epoch = shared_load_relaxed(&slot->reader_role_epoch);
@@ -49,6 +53,8 @@ Result<void> reclaim_dead_consumer_slots(std::byte* base, uint64_t old_role_epoc
 				return make_error(ErrorCode::kRecoveryBlocked, "Consumer::open",
 				                  "reading slot epoch unknown");
 			}
+			auto available = control_check();
+			if (!available) return available;
 			slot_release_read(slot);
 		}
 
@@ -242,6 +248,13 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 
 	}
 
+	auto handle = std::make_shared<ConsumerHandle>();
+	handle->owner_pid = self.pid;
+	(void)CancellationAccess::native_handle(handle->control_stop.token());
+	handle->shm.name = options.name;
+	handle->channel_name = options.name;
+	auto committing = control_begin_commit();
+	if (!committing) return committing.error();
 	ProcessIdentityAbi cid{};
 	cid.pid = self.pid;
 	cid.proc_start_ticks = self.proc_start_ticks;
@@ -252,16 +265,14 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 	const uint64_t role_epoch = cw.value();
 	shared_store_release(&header->consumer_state,
 	                     static_cast<uint32_t>(EndpointState::kOnline));
+	control_committed();
 	EDGE_FAILPOINT(C15);
 
-	auto handle = std::make_shared<ConsumerHandle>();
-	handle->shm.name = options.name;
 	handle->shm.fd = std::move(fd);
 	handle->shm.mapping = std::move(mapping);
 	handle->shm.dev = dev;
 	handle->shm.ino = ino;
 	handle->shm.size = size;
-	handle->channel_name = options.name;
 	handle->transport = options.transport;
 	handle->generation = header->generation;
 	handle->role_epoch = role_epoch;
@@ -287,6 +298,7 @@ struct ConsumerUseGuard {
 };
 
 void mark_consumer_offline(ConsumerHandle& handle) noexcept {
+	consumer_clear_notifications(handle);
 	auto* base = static_cast<std::byte*>(handle.shm.mapping.get());
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
 	auto cid_res = identity_snapshot_read(&header->consumer);
@@ -296,6 +308,9 @@ void mark_consumer_offline(ConsumerHandle& handle) noexcept {
 }
 
 void service_consumer_shutdown(const std::shared_ptr<ConsumerHandle>& handle) noexcept {
+	if (handle->control_closed || (handle->controlled_stop.load(std::memory_order_acquire) &&
+	                               !handle->legacy_cleanup.load(std::memory_order_acquire)))
+		return;
 	if (!handle->shutdown_pending.load(std::memory_order_acquire)) return;
 	bool idle = false;
 	if (!handle->operation_in_use.compare_exchange_strong(idle, true, std::memory_order_acq_rel)) {
@@ -328,6 +343,8 @@ struct ClaimedRead {
 // 先抢占 latest 指向的槽，再复核 ticket；Producer 在复核前覆盖槽时立即重试。
 Result<ClaimedRead> claim_latest_unlocked(const std::shared_ptr<ConsumerHandle>& handle,
                                          const char* operation, bool loaned = false) noexcept {
+	if (handle->shutdown_pending.load(std::memory_order_acquire))
+		return make_error(ErrorCode::kClosed, operation, "stop requested");
 
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
@@ -513,8 +530,12 @@ Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHan
 		                  "monotonic clock unavailable");
 	}
 
+	if (handle->shutdown_pending.load(std::memory_order_acquire))
+		return make_error(ErrorCode::kClosed, "Consumer::wait_latest");
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
+	CancellationRegistration stop_registration(handle->control_stop.token(),
+	                                           &header->notify_epoch);
 
 	for (;;) {
 		const auto read = try_read_latest_unlocked(handle, encoded_out, encoded_cap);
@@ -539,6 +560,8 @@ Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHan
 		struct timespec ts {};
 		ts.tv_sec = static_cast<time_t>(remaining / 1000000000ull);
 		ts.tv_nsec = static_cast<long>(remaining % 1000000000ull);
+		if (handle->shutdown_pending.load(std::memory_order_acquire))
+			return make_error(ErrorCode::kClosed, "Consumer::wait_latest");
 		const int rc = futex_wait(&header->notify_epoch, expected, &ts);
 		if (rc == 0) continue;
 		if (rc < 0 && (errno == EAGAIN || errno == EINTR)) {
@@ -588,8 +611,12 @@ Result<ReadLoan> consumer_wait_loan_latest_impl(const std::shared_ptr<ConsumerHa
 		                       "monotonic clock unavailable"));
 	}
 
+	if (handle->shutdown_pending.load(std::memory_order_acquire))
+		return fail(make_error(ErrorCode::kClosed, "Consumer::wait_loan_latest"));
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
+	CancellationRegistration stop_registration(handle->control_stop.token(),
+	                                           &header->notify_epoch);
 	for (;;) {
 		auto claimed = claim_latest_unlocked(handle, "Consumer::wait_loan_latest", true);
 		if (claimed) {
@@ -616,6 +643,8 @@ Result<ReadLoan> consumer_wait_loan_latest_impl(const std::shared_ptr<ConsumerHa
 		struct timespec ts {};
 		ts.tv_sec = static_cast<time_t>(remaining / 1000000000ull);
 		ts.tv_nsec = static_cast<long>(remaining % 1000000000ull);
+		if (handle->shutdown_pending.load(std::memory_order_acquire))
+			return fail(make_error(ErrorCode::kClosed, "Consumer::wait_loan_latest"));
 		const int rc = futex_wait(&header->notify_epoch, expected, &ts);
 		if (rc == 0 || (rc < 0 && (errno == EAGAIN || errno == EINTR))) continue;
 		if (rc < 0 && errno == ETIMEDOUT) {
@@ -643,6 +672,8 @@ Result<ReconnectInfo> consumer_reconnect_impl(
 	guard.armed = true;
 
 	try {
+		if (handle->shutdown_pending.load(std::memory_order_acquire))
+			return make_error(ErrorCode::kClosed, "Consumer::reconnect");
 		ChannelOptions options;
 		options.name = handle->channel_name;
 		options.transport = handle->transport;
@@ -697,6 +728,7 @@ Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>
 	}
 	guard.armed = true;
 
+	if (handle->control_closed) return make_error(ErrorCode::kClosed, "Consumer::status");
 	if (handle->transport == Transport::kPosixShm) {
 		const std::string shm_name = channel_shm_name(handle->channel_name);
 		auto re = shm_open_existing(shm_name);
@@ -718,8 +750,99 @@ Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>
 }
 
 void consumer_shutdown_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept {
+	if (handle->control_closed) return;
+	handle->legacy_cleanup.store(true, std::memory_order_release);
 	handle->shutdown_pending.store(true, std::memory_order_release);
+	(void)handle->control_stop.request_cancel();
 	service_consumer_shutdown(handle);
+}
+
+Result<std::shared_ptr<ConsumerHandle>> consumer_open_controlled(
+        const ChannelOptions& options, const SchemaDescriptor& schema, uint32_t payload_size,
+        const ControlOperationContext& context, ControlReceipt& receipt) {
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, "Consumer::open",
+		                  "finalize receipt first");
+	ControlScope scope(context, receipt);
+	auto checked = control_check();
+	if (!checked) return checked.error();
+	try {
+		auto opened = consumer_open_impl(options, schema, payload_size);
+		if (!opened) {
+			checked = control_check();
+			if (!checked) return checked.error();
+		}
+		return opened;
+	} catch (...) {
+		return make_errno_error(ENOMEM, "Consumer::open", "allocation before commit");
+	}
+}
+
+Result<ReconnectInfo> consumer_reconnect_controlled(const std::shared_ptr<ConsumerHandle>& handle,
+                                                    const ControlOperationContext& context,
+                                                    ControlReceipt& receipt) noexcept {
+	if (!handle) return make_error(ErrorCode::kClosed, "Consumer::reconnect");
+	if (handle->owner_pid != static_cast<uint64_t>(::getpid()))
+		return make_error(ErrorCode::kStaleHandle, "Consumer::reconnect",
+		                  "foreign process handle");
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, "Consumer::reconnect",
+		                  "finalize receipt first");
+	ControlScope scope(context, receipt, handle->control_stop.token());
+	auto checked = control_check();
+	if (!checked) return checked.error();
+	auto reopened = consumer_reconnect_impl(handle);
+	if (!reopened) {
+		checked = control_check();
+		if (!checked) return checked.error();
+	}
+	return reopened;
+}
+
+void consumer_request_stop(const std::shared_ptr<ConsumerHandle>& handle) noexcept {
+	if (!handle) return;
+	if (handle->owner_pid != static_cast<uint64_t>(::getpid())) return;
+	handle->controlled_stop.store(true, std::memory_order_release);
+	handle->shutdown_pending.store(true, std::memory_order_release);
+	(void)handle->control_stop.request_cancel();
+}
+
+Result<ControlCloseStatus> consumer_finalize(const std::shared_ptr<ConsumerHandle>& handle,
+                                             const ControlOperationContext& context,
+                                             ControlReceipt& receipt) noexcept {
+	if (!handle) return ControlCloseStatus::kClosed;
+	if (handle->owner_pid != static_cast<uint64_t>(::getpid()))
+		return make_error(ErrorCode::kStaleHandle, "Consumer::finalize",
+		                  "foreign process handle");
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, "Consumer::finalize",
+		                  "finalize receipt first");
+	ControlScope scope(context, receipt);
+	consumer_request_stop(handle);
+	control_handle_pending();
+	ConsumerUseGuard guard;
+	guard.in_use = &handle->operation_in_use;
+	if (handle->operation_in_use.exchange(true, std::memory_order_acq_rel)) {
+		control_handle_pending();
+		return ControlCloseStatus::kPending;
+	}
+	guard.armed = true;
+	if (handle->control_closed) {
+		control_committed();
+		return ControlCloseStatus::kClosed;
+	}
+	auto available = context.check();
+	if (!available) {
+		control_handle_pending(available.error());
+		return ControlCloseStatus::kPending;
+	}
+	mark_consumer_offline(*handle);
+	handle->shm.mapping.reset();
+	handle->shm.fd.reset();
+	handle->control_closed = true;
+	handle->shutdown_started.store(true, std::memory_order_release);
+	control_committed();
+	return ControlCloseStatus::kClosed;
 }
 
 void consumer_release_loan_impl(ReadLoan* loan) noexcept {

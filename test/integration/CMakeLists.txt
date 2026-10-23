@@ -1,6 +1,21 @@
 # 集成测试必须通过独立可执行文件和 fork/exec 验证进程边界行为。
 
 find_package(Python3 QUIET COMPONENTS Interpreter)
+add_executable(control_lock_peer helpers/control_lock_peer.cpp)
+edgeruntime_apply_project_options(control_lock_peer)
+target_link_libraries(control_lock_peer PRIVATE self_ipcs)
+target_include_directories(control_lock_peer PRIVATE ../fixtures)
+add_executable(control_deadline_test control_deadline_test.cpp)
+edgeruntime_apply_project_options(control_deadline_test)
+target_link_libraries(control_deadline_test PRIVATE self_ipcs GTest::gtest_main)
+target_include_directories(control_deadline_test PRIVATE ../fixtures ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(control_deadline_test PRIVATE CONTROL_LOCK_PEER="$<TARGET_FILE:control_lock_peer>")
+target_link_options(control_deadline_test PRIVATE
+  "LINKER:--wrap=flock,--wrap=fdatasync,--wrap=poll,--wrap=recvmsg,--wrap=eventfd,--wrap=write"
+  "LINKER:--wrap=_ZN12edge_runtime6detail17failpoint_triggerEPKNS0_15FailpointRecordE"
+  "LINKER:--wrap=_ZN12edge_runtime6detail10futex_waitEPKvjPK8timespec")
+add_dependencies(control_deadline_test control_lock_peer)
+gtest_discover_tests(control_deadline_test PROPERTIES TIMEOUT 15 LABELS integration)
 if(Python3_Interpreter_FOUND)
   add_test(NAME cmake_option_compatibility
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake_options_test.py

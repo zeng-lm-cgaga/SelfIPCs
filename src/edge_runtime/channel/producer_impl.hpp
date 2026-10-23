@@ -28,6 +28,8 @@ class NotificationServer;
 struct ProducerHandle {
 	ShmObject shm;
 	std::string channel_name;
+	std::string lock_path;
+	std::string shm_name;
 	uint64_t generation{0};
 	uint64_t role_epoch{0};
 	uint64_t instance_nonce_hi{0};
@@ -36,15 +38,23 @@ struct ProducerHandle {
 	uint32_t schema_version{0};
 	uint32_t payload_size{0};
 	ProcessIdentity self{};
+	uint64_t owner_pid{};
 	std::atomic<bool> operation_in_use{false};
 	std::atomic<bool> shutdown_pending{false};
 	std::atomic<bool> shutdown_started{false};
+	std::atomic<bool> controlled_stop{false};
+	std::atomic<bool> legacy_cleanup{false};
+	CancellationSource control_stop;
+	bool control_closed{false};
 
 	Transport transport{Transport::kPosixShm};
 	uint32_t channel_hash{0};
 	std::string socket_path;
+	uint64_t socket_dev{};
+	uint64_t socket_ino{};
 	UniqueFd listen_fd;
 	std::atomic<bool> serve_stop{false};
+	std::atomic<bool> serve_exited{false};
 	std::thread server_thread;
 	bool socket_unlinked{false};
 

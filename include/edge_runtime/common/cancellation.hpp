@@ -9,6 +9,7 @@ namespace edge_runtime {
 namespace detail {
 struct CancellationState;
 class CancellationRegistration;
+class CancellationAccess;
 }  // namespace detail
 
 class CancellationToken {
@@ -19,6 +20,7 @@ class CancellationToken {
        private:
 	friend class CancellationSource;
 	friend class detail::CancellationRegistration;
+	friend class detail::CancellationAccess;
 	explicit CancellationToken(std::shared_ptr<detail::CancellationState> state) noexcept
 	    : state_(std::move(state)) {}
 	std::shared_ptr<detail::CancellationState> state_;

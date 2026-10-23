@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "edge_runtime/channel/channel_options.hpp"
+#include "edge_runtime/channel/control_context.hpp"
 #include "edge_runtime/channel/event_notification.hpp"
 #include "edge_runtime/channel/loan.hpp"
 #include "edge_runtime/channel/sample.hpp"
@@ -31,6 +32,22 @@ Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<Prod
                                                       NotificationBackend backend);
 Result<void> producer_disable_event_notifications_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 int producer_event_notification_error_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
+Result<std::shared_ptr<ProducerHandle>> producer_create_controlled(const ChannelOptions&,
+                                                                   const SchemaDescriptor&,
+                                                                   uint32_t,
+                                                                   const ControlOperationContext&,
+                                                                   ControlReceipt&);
+Result<void> producer_enable_controlled(const std::shared_ptr<ProducerHandle>&, NotificationBackend,
+                                        const ControlOperationContext&, ControlReceipt&);
+Result<ControlCloseStatus> producer_disable_controlled(const std::shared_ptr<ProducerHandle>&,
+                                                       const ControlOperationContext&,
+                                                       ControlReceipt&) noexcept;
+Result<void> producer_remove_controlled(const std::shared_ptr<ProducerHandle>&,
+                                        const ControlOperationContext&, ControlReceipt&) noexcept;
+void producer_request_stop(const std::shared_ptr<ProducerHandle>&) noexcept;
+Result<ControlCloseStatus> producer_finalize(const std::shared_ptr<ProducerHandle>&,
+                                             const ControlOperationContext&,
+                                             ControlReceipt&) noexcept;
 
 }  // 命名空间 edge_runtime::detail
 
@@ -50,6 +67,41 @@ class Producer {
 		                                      PayloadCodec<T>::kEncodedSize);
 		if (!h) return h.error();
 		return Producer(std::move(h.value()));
+	}
+
+	static Result<Producer> create(const ChannelOptions& options,
+	                               const SchemaDescriptor& schema,
+	                               const ControlOperationContext& context,
+	                               ControlReceipt& receipt) {
+		detail::validate_payload_codec<T>();
+		auto handle = detail::producer_create_controlled(
+		        options, schema, PayloadCodec<T>::kEncodedSize, context, receipt);
+		if (!handle) return handle.error();
+		return Producer(std::move(handle.value()));
+	}
+
+	Result<void> enable_event_notifications(
+	        const ControlOperationContext& context, ControlReceipt& receipt,
+	        NotificationBackend backend = NotificationBackend::kEventFd) {
+		return detail::producer_enable_controlled(handle_, backend, context, receipt);
+	}
+	Result<ControlCloseStatus> disable_event_notifications(
+	        const ControlOperationContext& context, ControlReceipt& receipt) noexcept {
+		return detail::producer_disable_controlled(handle_, context, receipt);
+	}
+	Result<void> remove_if_owner(const ControlOperationContext& context,
+	                             ControlReceipt& receipt) noexcept {
+		return detail::producer_remove_controlled(handle_, context, receipt);
+	}
+	void request_stop() const noexcept { detail::producer_request_stop(handle_); }
+	Result<ControlCloseStatus> finalize(const ControlOperationContext& context,
+	                                    ControlReceipt& receipt) noexcept {
+		return detail::producer_finalize(handle_, context, receipt);
+	}
+	Result<ControlCloseStatus> close(const ControlOperationContext& context,
+	                                 ControlReceipt& receipt) noexcept {
+		request_stop();
+		return finalize(context, receipt);
 	}
 
 	// 编码失败时不触碰共享内存；成功后只发布完整的最新样本。

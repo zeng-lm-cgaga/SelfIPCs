@@ -7,16 +7,18 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "edge_runtime/channel/channel_options.hpp"
 #include "edge_runtime/channel/consumer.hpp"
+#include "edge_runtime/channel/sample.hpp"
+#include "edge_runtime/common/result.hpp"
+#include "edge_runtime/common/schema.hpp"
 #include "edge_runtime/process/process_identity.hpp"
 #include "edge_runtime/transport/shm_object.hpp"
-#include "edge_runtime/common/result.hpp"
-#include "edge_runtime/channel/sample.hpp"
-#include "edge_runtime/common/schema.hpp"
 
 namespace edge_runtime::detail {
+struct EventNotificationState;
 
 // ConsumerHandle 保存映射身份和读取游标；operation_in_use 防止同一句柄重入。
 struct ConsumerHandle {
@@ -31,6 +33,7 @@ struct ConsumerHandle {
 	uint32_t schema_version{0};
 	uint32_t payload_size{0};
 	ProcessIdentity self{};
+	uint64_t owner_pid{};
 
 	uint64_t reconnect_timeout_ms{1000};
 	uint64_t last_sequence{0};
@@ -38,7 +41,14 @@ struct ConsumerHandle {
 	std::atomic<bool> operation_in_use{false};
 	std::atomic<bool> shutdown_pending{false};
 	std::atomic<bool> shutdown_started{false};
+	std::atomic<bool> controlled_stop{false};
+	std::atomic<bool> legacy_cleanup{false};
+	CancellationSource control_stop;
+	bool control_closed{false};
+	std::vector<std::weak_ptr<EventNotificationState>> notifications;
 };
+
+void consumer_clear_notifications(ConsumerHandle& handle) noexcept;
 
 Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions& options,
                                                            const SchemaDescriptor& schema,

@@ -1,6 +1,6 @@
 #include "edge_runtime/channel/producer_impl.hpp"
-#include "edge_runtime/channel/notification_service.hpp"
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -8,13 +8,16 @@
 #include <utility>
 
 #include "edge_runtime/channel/channel_abi.hpp"
-#include "edge_runtime/utility/checksum.hpp"
-#include "edge_runtime/sync/clock.hpp"
-#include "edge_runtime/utility/failpoint.hpp"
-#include "edge_runtime/transport/fd_broker.hpp"
-#include "edge_runtime/sync/futex.hpp"
-#include "edge_runtime/utility/random.hpp"
+#include "edge_runtime/channel/control_operation.hpp"
+#include "edge_runtime/channel/notification_service.hpp"
 #include "edge_runtime/channel/slot_protocol.hpp"
+#include "edge_runtime/sync/cancellation.hpp"
+#include "edge_runtime/sync/clock.hpp"
+#include "edge_runtime/sync/futex.hpp"
+#include "edge_runtime/transport/fd_broker.hpp"
+#include "edge_runtime/utility/checksum.hpp"
+#include "edge_runtime/utility/failpoint.hpp"
+#include "edge_runtime/utility/random.hpp"
 
 namespace edge_runtime::detail {
 
@@ -24,10 +27,44 @@ struct JournalGuard {
 	ControlLock* lock = nullptr;
 	ControlJournalV1 reset_to{};
 	bool armed = false;
+	bool rollback_blocked = false;
+	std::string socket_path;
+	uint64_t socket_dev{};
+	uint64_t socket_ino{};
 
 	~JournalGuard() {
 		if (armed && lock != nullptr) {
-			(void)lock->write_journal(reset_to);
+			const auto expected = lock->attempted_journal();
+			bool socket_pending = false;
+			if (socket_ino != 0) {
+				struct stat status {};
+				const auto available = control_check();
+				if (!available)
+					socket_pending = true;
+				else if (::lstat(socket_path.c_str(), &status) == 0) {
+					if (static_cast<uint64_t>(status.st_dev) != socket_dev ||
+					    static_cast<uint64_t>(status.st_ino) != socket_ino ||
+					    !S_ISSOCK(status.st_mode) ||
+					    ::unlink(socket_path.c_str()) != 0)
+						socket_pending = true;
+				} else if (errno != ENOENT)
+					socket_pending = true;
+			}
+			if (rollback_blocked) {
+				if (socket_pending) control_retain_socket(socket_dev, socket_ino);
+				return;
+			}
+			if (socket_pending) {
+				control_retain_cleanup(*lock, expected, reset_to, false, 0, 0);
+				control_retain_socket(socket_dev, socket_ino);
+				return;
+			}
+			auto reset = lock->write_journal(reset_to);
+			if (!reset || socket_pending) {
+				control_retain_cleanup(*lock, reset ? reset_to : expected, reset_to,
+				                       false, 0, 0);
+				if (socket_pending) control_retain_socket(socket_dev, socket_ino);
+			}
 		}
 	}
 };
@@ -41,10 +78,14 @@ struct CreatedObjectGuard {
 
 	~CreatedObjectGuard() {
 		if (armed) {
-			auto removed = shm_unlink_checked(name, dev, ino);
+			auto available = control_check();
+			auto removed = available ? shm_unlink_checked(name, dev, ino) : available;
 			if (!removed && removed.error().code != ErrorCode::kNotFound &&
 			    journal_guard != nullptr) {
-				journal_guard->armed = false;
+				journal_guard->rollback_blocked = true;
+				control_retain_cleanup(*journal_guard->lock,
+				                       journal_guard->lock->attempted_journal(),
+				                       journal_guard->reset_to, true, dev, ino);
 			}
 		}
 	}
@@ -83,12 +124,20 @@ void mark_producer_offline(ProducerHandle& handle) noexcept {
 	if (jr && jr.value().new_generation == handle.generation &&
 	    jr.value().new_nonce_hi == handle.instance_nonce_hi &&
 	    jr.value().new_nonce_lo == handle.instance_nonce_lo) {
-		(void)::unlink(handle.socket_path.c_str());
-		handle.socket_unlinked = true;
+		struct stat status {};
+		if (::lstat(handle.socket_path.c_str(), &status) == 0 && S_ISSOCK(status.st_mode) &&
+		    status.st_uid == ::geteuid() &&
+		    static_cast<uint64_t>(status.st_dev) == handle.socket_dev &&
+		    static_cast<uint64_t>(status.st_ino) == handle.socket_ino &&
+		    ::unlink(handle.socket_path.c_str()) == 0)
+			handle.socket_unlinked = true;
 	}
 }
 
 void service_producer_shutdown(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	if (handle->control_closed || (handle->controlled_stop.load(std::memory_order_acquire) &&
+	                               !handle->legacy_cleanup.load(std::memory_order_acquire)))
+		return;
 	if (!handle->shutdown_pending.load(std::memory_order_acquire)) return;
 	bool idle = false;
 	if (!handle->operation_in_use.compare_exchange_strong(idle, true, std::memory_order_acq_rel)) {
@@ -109,6 +158,8 @@ void release_producer_loan_operation(const std::shared_ptr<ProducerHandle>& hand
 // 只有确认映射身份、代数和 Producer role_epoch 都未变化，句柄才允许写共享内存。
 Result<ChannelHeaderAbi*> verify_handle_ownership(const ProducerHandle& handle,
                                                   const char* operation) noexcept {
+	if (handle.controlled_stop.load(std::memory_order_acquire) || handle.control_closed)
+		return make_error(ErrorCode::kClosed, operation, "stop requested");
 	auto* base = static_cast<std::byte*>(handle.shm.mapping.get());
 	auto* boot = reinterpret_cast<BootstrapHeaderAbi*>(base);
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
@@ -192,6 +243,8 @@ Result<ControlJournalV1> reconcile_stale_journal(ControlLock& lock, const Contro
 				return make_error(ErrorCode::kRecoveryBlocked, "Producer::create",
 				                  "object under name after preobject crash");
 			}
+			auto available = control_check();
+			if (!available) return available.error();
 			auto un = shm_unlink_checked(shm_name, dev, ino);
 			if (!un) return un.error();
 			break;
@@ -298,6 +351,16 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	const std::string lock_path = channel_lock_path(options.name);
 	const std::string socket_path = channel_socket_path(options.name);
 	const uint32_t name_hash = channel_name_hash(options.name.c_str(), options.name.size());
+	auto handle = std::make_shared<ProducerHandle>();
+	handle->owner_pid = self.pid;
+	(void)CancellationAccess::native_handle(handle->control_stop.token());
+	handle->shm.name = options.name;
+	handle->channel_name = options.name;
+	handle->lock_path = lock_path;
+	handle->shm_name = shm_name;
+	if (fd_mode) handle->socket_path = socket_path;
+	auto cleanup_prepared = control_prepare_cleanup(lock_path, shm_name);
+	if (!cleanup_prepared) return cleanup_prepared.error();
 
 	auto lock_res = ControlLock::acquire(lock_path);
 	if (!lock_res) return lock_res.error();
@@ -411,6 +474,8 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 			                  "generation wrap");
 		}
 		generation = eheader->generation + 1;
+		auto committing = control_begin_commit();
+		if (!committing) return committing.error();
 		EDGE_FAILPOINT(C10);
 		auto un = shm_unlink_checked(shm_name, edev, eino);
 		if (!un) return un.error();
@@ -431,14 +496,17 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	JournalGuard journal_guard;
 	journal_guard.lock = &lock;
 	journal_guard.reset_to = journal;
+	journal_guard.socket_path = socket_path;
 
 	auto j0 = make_control_journal(options.name, JournalState::kCreatingPreObject,
 	                               journal.old_generation, generation, journal.old_nonce_hi,
 	                               journal.old_nonce_lo, nonce_hi, nonce_lo, self);
 	j0.transport = static_cast<uint32_t>(options.transport);
+	auto committing = control_begin_commit();
+	if (!committing) return committing.error();
+	journal_guard.armed = true;
 	auto wj0 = lock.write_journal(j0);
 	if (!wj0) return wj0.error();
-	journal_guard.armed = true;
 
 	UniqueFd fd;
 	uint64_t cdev = 0;
@@ -473,6 +541,7 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 			j0.target_dev = cdev;
 			j0.target_ino = cino;
 			auto retained = lock.write_journal(j0);
+			control_retain_cleanup(lock, j0, journal, true, cdev, cino);
 			if (!retained) return retained.error();
 			if (!captured) return captured.error();
 			auto removed = shm_unlink_checked(shm_name, cdev, cino);
@@ -564,18 +633,26 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	                     static_cast<uint32_t>(EndpointState::kOnline));
 
 	UniqueFd listen_fd;
-	bool socket_bound = false;
 	if (fd_mode) {
+		auto available = control_check();
+		if (!available) return available.error();
 		auto b = fd_broker_bind(socket_path);
 		if (!b) return b.error();
 		listen_fd = std::move(b.value());
-		socket_bound = true;
+		struct stat status {};
+		if (::lstat(socket_path.c_str(), &status) != 0) {
+			journal_guard.socket_ino = UINT64_MAX;
+			return make_error(ErrorCode::kRecoveryBlocked, "Producer::create",
+			                  "bound socket identity unavailable");
+		}
+		journal_guard.socket_dev = static_cast<uint64_t>(status.st_dev);
+		journal_guard.socket_ino = static_cast<uint64_t>(status.st_ino);
+		handle->socket_dev = journal_guard.socket_dev;
+		handle->socket_ino = journal_guard.socket_ino;
 		EDGE_FAILPOINT(C17);
 	}
 
-	shared_store_release(&header->init_state, static_cast<uint32_t>(InitState::kReady));
 	auto* boot_map = reinterpret_cast<BootstrapHeaderAbi*>(base);
-	shared_store_release(&boot_map->init_state, static_cast<uint32_t>(InitState::kReady));
 
 	auto jdone = make_control_journal(options.name, JournalState::kIdle, journal.old_generation,
 	                                  generation, journal.old_nonce_hi, journal.old_nonce_lo,
@@ -583,23 +660,14 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	jdone.transport = static_cast<uint32_t>(options.transport);
 	jdone.target_dev = cdev;
 	jdone.target_ino = cino;
-	auto wjdone = lock.write_journal(jdone);
-	if (!wjdone) {
-		if (socket_bound) (void)::unlink(socket_path.c_str());
-		return wjdone.error();
-	}
-
-	journal_guard.armed = false;
-	created.armed = false;
-
-	auto handle = std::make_shared<ProducerHandle>();
-	handle->shm.name = options.name;
+	const bool controlled = control_context() != nullptr;
+	auto available = control_begin_commit();
+	if (!available) return available.error();
 	handle->shm.fd = std::move(fd);
 	handle->shm.mapping = std::move(region);
 	handle->shm.dev = cdev;
 	handle->shm.ino = cino;
 	handle->shm.size = mapping;
-	handle->channel_name = options.name;
 	handle->generation = generation;
 	handle->role_epoch = role_epoch;
 	handle->instance_nonce_hi = nonce_hi;
@@ -612,24 +680,49 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	handle->channel_hash = name_hash;
 	handle->heartbeat_interval_ns = heartbeat_interval_ns;
 	if (fd_mode) {
-		handle->socket_path = socket_path;
 		handle->listen_fd = std::move(listen_fd);
 	}
 
-	if (fd_mode) {
+	auto start_server = [&]() -> Result<void> {
+		if (!fd_mode) return Result<void>::ok();
 		const int listen = handle->listen_fd.get();
 		const int shm_fd = handle->shm.fd.get();
 		std::byte* serve_base = static_cast<std::byte*>(handle->shm.mapping.get());
 		try {
-			handle->server_thread = std::thread(
-			        fd_broker_serve_loop, listen, shm_fd, serve_base,
-			        &handle->channel_hash, &handle->schema_fingerprint,
-			        &handle->serve_stop);
+			handle->server_thread = std::thread([handle_pointer = handle.get(), listen,
+			                                     shm_fd, serve_base] {
+				fd_broker_serve_loop(listen, shm_fd, serve_base,
+				                     &handle_pointer->channel_hash,
+				                     &handle_pointer->schema_fingerprint,
+				                     &handle_pointer->serve_stop);
+				handle_pointer->serve_exited.store(true, std::memory_order_release);
+			});
 		} catch (...) {
-			(void)::unlink(socket_path.c_str());
 			return make_error(ErrorCode::kSystemError, "Producer::create",
 			                  "serving thread start failed");
 		}
+		return Result<void>::ok();
+	};
+	if (controlled) {
+		auto started = start_server();
+		if (!started) return started.error();
+	}
+	shared_store_release(&header->init_state, static_cast<uint32_t>(InitState::kReady));
+	shared_store_release(&boot_map->init_state, static_cast<uint32_t>(InitState::kReady));
+	control_committed();
+	EDGE_FAILPOINT(CONTROL_CREATE_COMMITTED);
+	if (controlled) {
+		journal_guard.armed = false;
+		created.armed = false;
+		auto wjdone = lock.write_journal(jdone);
+		if (!wjdone) control_retain_cleanup(lock, j1, jdone, false, 0, 0);
+	} else {
+		auto wjdone = lock.write_journal(jdone);
+		if (!wjdone) return wjdone.error();
+		auto started = start_server();
+		if (!started) return started.error();
+		journal_guard.armed = false;
+		created.armed = false;
 	}
 	return Result<std::shared_ptr<ProducerHandle>>(std::move(handle));
 }
@@ -737,6 +830,10 @@ Result<void> producer_enable_event_notifications_impl(const std::shared_ptr<Prod
 	auto verified = verify_handle_ownership(*handle, "Producer::enable_event_notifications");
 	if (!verified) return verified.error();
 	if (handle->notification_server) {
+		if (handle->notification_server->stopping())
+			return make_error(ErrorCode::kClosed,
+			                  "Producer::enable_event_notifications",
+			                  "finalize disable first");
 		if (handle->notification_server->backend() != backend)
 			return make_error(ErrorCode::kInvalidOptions,
 			                  "Producer::enable_event_notifications",
@@ -764,6 +861,7 @@ int producer_event_notification_error_impl(const std::shared_ptr<ProducerHandle>
 }
 
 Result<ChannelStatus> producer_status_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	if (handle->control_closed) return make_error(ErrorCode::kClosed, "Producer::status");
 	ProducerUseGuard use(&handle->operation_in_use);
 	if (!use) {
 		return make_error(ErrorCode::kConcurrentHandleUse, "Producer::status",
@@ -792,6 +890,8 @@ Result<ChannelStatus> producer_status_impl(const std::shared_ptr<ProducerHandle>
 }
 
 void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	if (handle->control_closed) return;
+	handle->legacy_cleanup.store(true, std::memory_order_release);
 	handle->shutdown_pending.store(true, std::memory_order_release);
 	service_producer_shutdown(handle);
 }
@@ -923,14 +1023,18 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 		return make_error(ErrorCode::kConcurrentHandleUse, "Producer::remove_if_owner",
 		                  "concurrent handle use");
 	}
+	if (handle->control_closed)
+		return make_error(ErrorCode::kClosed, "Producer::remove_if_owner");
 
 	const bool fd_mode = handle->transport == Transport::kMemfdFdPass;
-	const std::string shm_name = channel_shm_name(handle->channel_name);
-	const std::string lock_path = channel_lock_path(handle->channel_name);
+	const std::string& shm_name = handle->shm_name;
+	const std::string& lock_path = handle->lock_path;
 
 	auto lock_res = ControlLock::acquire(lock_path);
 	if (!lock_res) return lock_res.error();
 	ControlLock lock = std::move(lock_res.value());
+	auto prepared = control_prepare_cleanup(lock_path, shm_name);
+	if (!prepared) return prepared;
 
 	auto jr = lock.read_journal();
 	if (!jr) return jr.error();
@@ -963,6 +1067,15 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 		                  "producer role changed");
 	}
 
+	if (handle->notification_server && control_context()) {
+		auto finished = handle->notification_server->finalize(*control_context());
+		if (!finished) {
+			control_handle_pending(finished.error());
+			return finished;
+		}
+	}
+	auto committing = control_begin_commit();
+	if (!committing) return committing;
 	if (fd_mode) {
 		handle->serve_stop.store(true, std::memory_order_relaxed);
 		if (handle->listen_fd.get() >= 0) {
@@ -982,20 +1095,33 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 	jr2.transport = static_cast<uint32_t>(handle->transport);
 	jr2.target_dev = dev;
 	jr2.target_ino = ino;
+	journal_guard.armed = true;
 	auto wj = lock.write_journal(jr2);
 	if (!wj) return wj.error();
-	journal_guard.armed = true;
+	committing = control_begin_commit();
+	if (!committing) return committing;
 
 	if (fd_mode) {
 
 		if (!handle->socket_unlinked) {
-			(void)::unlink(handle->socket_path.c_str());
+			struct stat status {};
+			if (::lstat(handle->socket_path.c_str(), &status) != 0 ||
+			    static_cast<uint64_t>(status.st_dev) != handle->socket_dev ||
+			    static_cast<uint64_t>(status.st_ino) != handle->socket_ino)
+				return make_error(ErrorCode::kNameRaceDetected,
+				                  "Producer::remove_if_owner",
+				                  "socket identity changed");
+			if (::unlink(handle->socket_path.c_str()) != 0)
+				return make_errno_error(errno, "Producer::remove_if_owner",
+				                        "unlink socket");
 			handle->socket_unlinked = true;
 		}
 	} else {
 		auto un = shm_unlink_checked(shm_name, dev, ino);
 		if (!un) return un.error();
 	}
+	control_committed();
+	journal_guard.armed = false;
 
 	auto jdone = make_control_journal(
 	        handle->channel_name, JournalState::kIdle, handle->generation, handle->generation,
@@ -1005,9 +1131,192 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 	jdone.target_dev = dev;
 	jdone.target_ino = ino;
 	auto wjd = lock.write_journal(jdone);
-	if (!wjd) return wjd.error();
-	journal_guard.armed = false;
+	if (!wjd) {
+		control_retain_cleanup(lock, jr2, jdone, false, 0, 0);
+		return control_context() ? Result<void>::ok() : wjd;
+	}
 	return Result<void>::ok();
+}
+
+Result<std::shared_ptr<ProducerHandle>> producer_create_controlled(
+        const ChannelOptions& options, const SchemaDescriptor& schema, uint32_t payload_size,
+        const ControlOperationContext& context, ControlReceipt& receipt) {
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, "Producer::create",
+		                  "finalize receipt first");
+	ControlScope scope(context, receipt);
+	auto checked = control_check();
+	if (!checked) return checked.error();
+	try {
+		return producer_create_impl(options, schema, payload_size);
+	} catch (...) {
+		return make_errno_error(ENOMEM, "Producer::create", "allocation before commit");
+	}
+}
+
+Result<void> producer_enable_controlled(const std::shared_ptr<ProducerHandle>& handle,
+                                        NotificationBackend backend,
+                                        const ControlOperationContext& context,
+                                        ControlReceipt& receipt) {
+	if (handle && handle->owner_pid != static_cast<uint64_t>(::getpid()))
+		return make_error(ErrorCode::kStaleHandle, "Producer::enable",
+		                  "foreign process handle");
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, "Producer::enable",
+		                  "finalize receipt first");
+	ControlScope scope(context, receipt,
+	                   handle ? handle->control_stop.token() : CancellationToken{});
+	auto checked = control_check();
+	if (!checked) return checked;
+	auto enabled = producer_enable_event_notifications_impl(handle, backend);
+	if (enabled)
+		control_committed();
+	else {
+		checked = control_check();
+		if (!checked) return checked;
+	}
+	return enabled;
+}
+
+Result<ControlCloseStatus> producer_disable_controlled(
+        const std::shared_ptr<ProducerHandle>& handle, const ControlOperationContext& context,
+        ControlReceipt& receipt) noexcept {
+	if (!handle) return make_error(ErrorCode::kClosed, "Producer::disable");
+	if (handle->owner_pid != static_cast<uint64_t>(::getpid()))
+		return make_error(ErrorCode::kStaleHandle, "Producer::disable",
+		                  "foreign process handle");
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, "Producer::disable",
+		                  "finalize receipt first");
+	ControlScope scope(context, receipt);
+	ProducerUseGuard use(&handle->operation_in_use);
+	if (!use) return make_error(ErrorCode::kConcurrentHandleUse, "Producer::disable");
+	auto available = context.check();
+	if (!available) return available.error();
+	if (handle->notification_server) {
+		auto checked = context.check();
+		if (!checked) return checked.error();
+		auto stopped = handle->notification_server->finalize(context);
+		if (!stopped) {
+			control_handle_pending(stopped.error());
+			return ControlCloseStatus::kPending;
+		}
+		handle->notification_server.reset();
+	}
+	control_committed();
+	return ControlCloseStatus::kClosed;
+}
+
+Result<void> producer_remove_controlled(const std::shared_ptr<ProducerHandle>& handle,
+                                        const ControlOperationContext& context,
+                                        ControlReceipt& receipt) noexcept {
+	if (!handle) return make_error(ErrorCode::kClosed, "Producer::remove");
+	if (handle->owner_pid != static_cast<uint64_t>(::getpid()))
+		return make_error(ErrorCode::kStaleHandle, "Producer::remove",
+		                  "foreign process handle");
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, "Producer::remove",
+		                  "finalize receipt first");
+	auto stop = handle->control_stop.token();
+	if (stop.is_cancelled()) stop = {};
+	ControlScope scope(context, receipt, std::move(stop));
+	auto checked = control_check();
+	if (!checked) return checked;
+	return producer_remove_if_owner_impl(handle);
+}
+
+void producer_request_stop(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	if (!handle) return;
+	if (handle->owner_pid != static_cast<uint64_t>(::getpid())) return;
+	handle->controlled_stop.store(true, std::memory_order_release);
+	handle->shutdown_pending.store(true, std::memory_order_release);
+	handle->serve_stop.store(true, std::memory_order_release);
+	(void)handle->control_stop.request_cancel();
+}
+
+Result<ControlCloseStatus> producer_finalize(const std::shared_ptr<ProducerHandle>& handle,
+                                             const ControlOperationContext& context,
+                                             ControlReceipt& receipt) noexcept {
+	if (!handle) return ControlCloseStatus::kClosed;
+	if (handle->owner_pid != static_cast<uint64_t>(::getpid()))
+		return make_error(ErrorCode::kStaleHandle, "Producer::finalize",
+		                  "foreign process handle");
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, "Producer::finalize",
+		                  "finalize receipt first");
+	ControlScope scope(context, receipt);
+	producer_request_stop(handle);
+	control_handle_pending();
+	ProducerUseGuard use(&handle->operation_in_use);
+	if (!use) {
+		control_handle_pending();
+		return ControlCloseStatus::kPending;
+	}
+	if (handle->control_closed) {
+		control_committed();
+		return ControlCloseStatus::kClosed;
+	}
+	auto pending = [&]() -> Result<ControlCloseStatus> {
+		auto checked = context.check();
+		control_handle_pending(checked ? make_error(ErrorCode::kConcurrentHandleUse,
+		                                            "Producer::finalize",
+		                                            "service cleanup pending")
+		                               : checked.error());
+		return ControlCloseStatus::kPending;
+	};
+	if (!context.check()) return pending();
+	if (handle->notification_server) {
+		auto stopped = handle->notification_server->finalize(context);
+		if (!stopped) {
+			control_handle_pending(stopped.error());
+			return ControlCloseStatus::kPending;
+		}
+		handle->notification_server.reset();
+	}
+	while (handle->server_thread.joinable() &&
+	       !handle->serve_exited.load(std::memory_order_acquire)) {
+		if (!control_pause(1'000'000)) return pending();
+	}
+	if (!context.check()) return pending();
+	if (handle->server_thread.joinable()) handle->server_thread.join();
+	if (handle->transport == Transport::kMemfdFdPass && !handle->socket_unlinked) {
+		auto locked = ControlLock::acquire(handle->lock_path);
+		if (!locked)
+			return locked.error().code == ErrorCode::kTimeout ||
+			                       locked.error().code == ErrorCode::kCancelled
+			               ? pending()
+			               : Result<ControlCloseStatus>(locked.error());
+		auto journal = locked.value().read_journal();
+		if (!journal) return journal.error();
+		if (journal.value().new_generation != handle->generation ||
+		    journal.value().new_nonce_hi != handle->instance_nonce_hi ||
+		    journal.value().new_nonce_lo != handle->instance_nonce_lo)
+			return make_error(ErrorCode::kStaleHandle, "Producer::finalize",
+			                  "journal identity changed");
+		struct stat status {};
+		if (::lstat(handle->socket_path.c_str(), &status) == 0) {
+			if (!S_ISSOCK(status.st_mode) ||
+			    static_cast<uint64_t>(status.st_dev) != handle->socket_dev ||
+			    static_cast<uint64_t>(status.st_ino) != handle->socket_ino)
+				return make_error(ErrorCode::kNameRaceDetected,
+				                  "Producer::finalize", "socket identity changed");
+			if (!control_begin_commit()) return pending();
+			if (::unlink(handle->socket_path.c_str()) != 0)
+				return make_errno_error(errno, "Producer::finalize",
+				                        "unlink socket");
+		} else if (errno != ENOENT)
+			return make_errno_error(errno, "Producer::finalize", "lstat socket");
+		handle->socket_unlinked = true;
+	}
+	if (!context.check()) return pending();
+	mark_producer_offline(*handle);
+	handle->listen_fd.reset();
+	handle->shm.mapping.reset();
+	handle->shm.fd.reset();
+	handle->control_closed = true;
+	handle->shutdown_started.store(true, std::memory_order_release);
+	control_committed();
+	return ControlCloseStatus::kClosed;
 }
 
 // 心跳只表示应用仍在推进，不改变所有权，也不能单独触发接管。

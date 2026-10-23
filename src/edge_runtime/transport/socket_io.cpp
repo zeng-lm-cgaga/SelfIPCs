@@ -9,30 +9,47 @@
 #include <cerrno>
 #include <cstring>
 
+#include "edge_runtime/channel/control_operation.hpp"
+#include "edge_runtime/sync/cancellation.hpp"
 #include "edge_runtime/sync/clock.hpp"
 
 namespace edge_runtime::detail::socket_io {
 
 bool budget_available(const IoBudget& budget) noexcept {
-	return (budget.stop == nullptr || !budget.stop->load(std::memory_order_relaxed)) &&
+	return static_cast<bool>(control_check()) &&
+	       (budget.stop == nullptr || !budget.stop->load(std::memory_order_relaxed)) &&
+	       (budget.cancellation == nullptr || !budget.cancellation->is_cancelled()) &&
 	       remaining_time_ns(budget.deadline_ns) != 0;
 }
 
 bool wait_socket(int fd, short events, const IoBudget& budget) noexcept {
 	while (budget_available(budget)) {
 		uint64_t remaining = remaining_time_ns(budget.deadline_ns);
-		if (budget.stop != nullptr) remaining = std::min(remaining, uint64_t{10'000'000});
+		const auto* context = control_context();
+		if (context)
+			remaining = std::min(remaining, remaining_time_ns(context->deadline_ns()));
+		if (budget.stop != nullptr || budget.cancellation != nullptr)
+			remaining = std::min(remaining, uint64_t{10'000'000});
+		if (context) remaining = std::min(remaining, uint64_t{10'000'000});
 		remaining = std::min(remaining, uint64_t{1'000'000'000});
-		struct pollfd descriptor { fd, events, 0 };
-		const int ready = ::poll(&descriptor, 1,
-		                         static_cast<int>((remaining + 999'999) / 1'000'000));
+		struct pollfd descriptors[4]{
+		        {fd, events, 0},
+		        {context ? CancellationAccess::native_handle(context->cancellation()) : -1,
+		         POLLIN, 0},
+		        {control_stop_handle(), POLLIN, 0},
+		        {budget.cancellation
+		                 ? CancellationAccess::native_handle(*budget.cancellation)
+		                 : -1,
+		         POLLIN, 0}};
+		const int ready =
+		        ::poll(descriptors, 4, static_cast<int>((remaining + 999'999) / 1'000'000));
 		if (ready < 0) {
 			if (errno == EINTR) continue;
 			return false;
 		}
 		if (ready == 0) continue;
 		return budget_available(budget) &&
-		       (descriptor.revents & (events | POLLHUP | POLLERR)) != 0;
+		       (descriptors[0].revents & (events | POLLHUP | POLLERR)) != 0;
 	}
 	errno = ETIMEDOUT;
 	return false;

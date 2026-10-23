@@ -13,12 +13,13 @@
 #include <cstring>
 
 #include "edge_runtime/channel/channel_layout.hpp"
+#include "edge_runtime/channel/control_operation.hpp"
 #include "edge_runtime/sync/clock.hpp"
 #include "edge_runtime/sync/shared_atomic.hpp"
+#include "edge_runtime/transport/socket_io.hpp"
 #include "edge_runtime/utility/checked_math.hpp"
 #include "edge_runtime/utility/checksum.hpp"
 #include "edge_runtime/utility/failpoint.hpp"
-#include "edge_runtime/transport/socket_io.hpp"
 
 #if defined(__linux__)
 #define EDGE_HAVE_MEMFD_CREATE 1
@@ -41,6 +42,11 @@ using socket_io::send_full;
 using socket_io::peer_is_same_uid;
 
 bool retry_pause(const IoBudget& budget) noexcept {
+	if (control_context()) {
+		auto paused = control_pause(
+		        std::min(remaining_time_ns(budget.deadline_ns), kConnectRetryIntervalNs));
+		return static_cast<bool>(paused) && budget_available(budget);
+	}
 	const uint64_t remaining = remaining_time_ns(budget.deadline_ns);
 	if (remaining == 0) return false;
 	const uint64_t pause_end =

@@ -9,16 +9,27 @@
 #include <utility>
 
 #include "edge_runtime/channel/channel_options.hpp"
+#include "edge_runtime/channel/control_context.hpp"
 #include "edge_runtime/channel/event_notification.hpp"
-#include "edge_runtime/common/error.hpp"
 #include "edge_runtime/channel/loan.hpp"
-#include "edge_runtime/common/result.hpp"
 #include "edge_runtime/channel/sample.hpp"
+#include "edge_runtime/common/error.hpp"
+#include "edge_runtime/common/result.hpp"
 #include "edge_runtime/common/schema.hpp"
 
 namespace edge_runtime::detail {
-
 struct ConsumerHandle;
+Result<std::shared_ptr<ConsumerHandle>> consumer_open_controlled(const ChannelOptions&,
+                                                                 const SchemaDescriptor&, uint32_t,
+                                                                 const ControlOperationContext&,
+                                                                 ControlReceipt&);
+Result<ReconnectInfo> consumer_reconnect_controlled(const std::shared_ptr<ConsumerHandle>&,
+                                                    const ControlOperationContext&,
+                                                    ControlReceipt&) noexcept;
+void consumer_request_stop(const std::shared_ptr<ConsumerHandle>&) noexcept;
+Result<ControlCloseStatus> consumer_finalize(const std::shared_ptr<ConsumerHandle>&,
+                                             const ControlOperationContext&,
+                                             ControlReceipt&) noexcept;
 
 // 读取实现只复制编码字节和这些元数据，模板层再负责把本地字节解码为 T。
 struct ReadSnapshot {
@@ -46,7 +57,7 @@ Result<ReconnectInfo> consumer_reconnect_impl(
 Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 void consumer_shutdown_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 
-}  // 命名空间 edge_runtime::detail
+}  // namespace edge_runtime::detail
 
 namespace edge_runtime {
 
@@ -127,6 +138,35 @@ class Consumer {
 		const uint64_t timeout_ns = count > 0 ? static_cast<uint64_t>(count) : 0;
 		return detail::consumer_wait_loan_latest_impl(handle_, timeout_ns);
 	}
+	static Result<Consumer> open(const ChannelOptions& options, const SchemaDescriptor& schema,
+	                             const ControlOperationContext& context,
+	                             ControlReceipt& receipt) {
+		detail::validate_payload_codec<T>();
+		auto handle = detail::consumer_open_controlled(
+		        options, schema, PayloadCodec<T>::kEncodedSize, context, receipt);
+		if (!handle) return handle.error();
+		return Consumer(std::move(handle.value()));
+	}
+	Result<ReconnectInfo> reconnect(const ControlOperationContext& context,
+	                                ControlReceipt& receipt) noexcept {
+		return detail::consumer_reconnect_controlled(handle_, context, receipt);
+	}
+	Result<EventNotification> event_notification(
+	        const ControlOperationContext& context, ControlReceipt& receipt,
+	        NotificationBackend backend = NotificationBackend::kEventFd) {
+		return detail::consumer_notification_controlled(handle_, backend, context, receipt);
+	}
+	void request_stop() const noexcept { detail::consumer_request_stop(handle_); }
+	Result<ControlCloseStatus> finalize(const ControlOperationContext& context,
+	                                    ControlReceipt& receipt) noexcept {
+		return detail::consumer_finalize(handle_, context, receipt);
+	}
+	Result<ControlCloseStatus> close(const ControlOperationContext& context,
+	                                 ControlReceipt& receipt) noexcept {
+		request_stop();
+		return finalize(context, receipt);
+	}
+
 	// 针对已替换实例重新打开并更新句柄资源。
 	Result<ReconnectInfo> reconnect() noexcept {
 		return detail::consumer_reconnect_impl(handle_);

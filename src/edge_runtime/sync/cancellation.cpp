@@ -1,6 +1,10 @@
 #include "edge_runtime/sync/cancellation.hpp"
 
+#include <sys/eventfd.h>
+#include <unistd.h>
+
 #include <atomic>
+#include <cerrno>
 #include <climits>
 #include <mutex>
 
@@ -10,6 +14,10 @@
 namespace edge_runtime::detail {
 
 struct CancellationState {
+	int wake_fd{-1};
+	~CancellationState() {
+		if (wake_fd >= 0) (void)::close(wake_fd);
+	}
 	std::atomic<bool> cancelled{false};
 	std::mutex mutex;
 	CancellationRegistration* first{nullptr};
@@ -17,6 +25,11 @@ struct CancellationState {
 	bool cancel() noexcept {
 		std::lock_guard<std::mutex> guard(mutex);
 		if (cancelled.exchange(true, std::memory_order_acq_rel)) return false;
+		if (wake_fd >= 0) {
+			const uint64_t value = 1;
+			while (::write(wake_fd, &value, sizeof(value)) < 0 && errno == EINTR) {
+			}
+		}
 		for (auto* registration = first; registration; registration = registration->next_) {
 			__atomic_fetch_add(registration->epoch_, uint32_t{1}, __ATOMIC_RELEASE);
 			(void)futex_wake(registration->epoch_, INT_MAX);
@@ -55,6 +68,16 @@ bool CancellationSource::request_cancel() const noexcept { return state_ && stat
 
 bool CancellationToken::is_cancelled() const noexcept {
 	return state_ && state_->cancelled.load(std::memory_order_acquire);
+}
+
+int detail::CancellationAccess::native_handle(const CancellationToken& token) noexcept {
+	if (!token.state_) return -1;
+	std::lock_guard<std::mutex> guard(token.state_->mutex);
+	if (token.state_->wake_fd < 0)
+		token.state_->wake_fd =
+		        ::eventfd(token.state_->cancelled.load(std::memory_order_acquire) ? 1 : 0,
+		                  EFD_NONBLOCK | EFD_CLOEXEC);
+	return token.state_->wake_fd;
 }
 
 }  // namespace edge_runtime

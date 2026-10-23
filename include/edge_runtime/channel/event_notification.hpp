@@ -5,6 +5,7 @@
 #include <memory>
 #include <utility>
 
+#include "edge_runtime/channel/control_context.hpp"
 #include "edge_runtime/common/result.hpp"
 
 namespace edge_runtime {
@@ -13,6 +14,10 @@ class EventNotification;
 namespace detail {
 struct ConsumerHandle;
 struct EventNotificationState;
+Result<EventNotification> consumer_notification_controlled(const std::shared_ptr<ConsumerHandle>&,
+                                                           NotificationBackend,
+                                                           const ControlOperationContext&,
+                                                           ControlReceipt&);
 Result<EventNotification> consumer_event_notification_impl(
         const std::shared_ptr<ConsumerHandle>& handle, uint64_t timeout_ms);
 Result<EventNotification> consumer_event_notification_impl(

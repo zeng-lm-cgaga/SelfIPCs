@@ -62,11 +62,22 @@ class ControlLock {
 	~ControlLock() { release(); }
 	ControlLock(const ControlLock&) = delete;
 	ControlLock& operator=(const ControlLock&) = delete;
-	ControlLock(ControlLock&& other) noexcept : fd_(other.fd_.release()) {}
+	ControlLock(ControlLock&& other) noexcept
+	    : fd_(other.fd_.release()),
+	      path_(std::move(other.path_)),
+	      attempted_journal_(other.attempted_journal_),
+	      last_journal_(other.last_journal_),
+	      dev_(other.dev_),
+	      ino_(other.ino_) {}
 	ControlLock& operator=(ControlLock&& other) noexcept {
 		if (this != &other) {
 			release();
 			fd_ = UniqueFd(other.fd_.release());
+			path_ = std::move(other.path_);
+			attempted_journal_ = other.attempted_journal_;
+			last_journal_ = other.last_journal_;
+			dev_ = other.dev_;
+			ino_ = other.ino_;
 		}
 		return *this;
 	}
@@ -76,10 +87,20 @@ class ControlLock {
 	Result<void> write_journal(const ControlJournalV1& journal) noexcept;
 
 	void release() noexcept;
+	const std::string& path() const noexcept { return path_; }
+	const ControlJournalV1& attempted_journal() const noexcept { return attempted_journal_; }
+	const ControlJournalV1& last_journal() const noexcept { return last_journal_; }
+	uint64_t dev() const noexcept { return dev_; }
+	uint64_t ino() const noexcept { return ino_; }
 
        private:
 	ControlLock() = default;
 	UniqueFd fd_;
+	std::string path_;
+	ControlJournalV1 attempted_journal_{};
+	ControlJournalV1 last_journal_{};
+	uint64_t dev_{};
+	uint64_t ino_{};
 };
 
 }  // 命名空间 edge_runtime::detail

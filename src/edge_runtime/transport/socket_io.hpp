@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 
+#include "edge_runtime/common/cancellation.hpp"
 #include "edge_runtime/transport/shm_object.hpp"
 
 namespace edge_runtime::detail::socket_io {
@@ -13,6 +14,7 @@ namespace edge_runtime::detail::socket_io {
 struct IoBudget {
 	uint64_t deadline_ns;
 	const std::atomic<bool>* stop = nullptr;
+	const CancellationToken* cancellation = nullptr;
 };
 
 bool budget_available(const IoBudget& budget) noexcept;

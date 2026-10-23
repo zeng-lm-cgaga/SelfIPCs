@@ -47,9 +47,12 @@ class NotificationServer {
 	                                                         NotificationBackend backend);
 	~NotificationServer();
 	void stop() noexcept;
+	void request_stop() noexcept;
+	Result<void> finalize(const ControlOperationContext& context) noexcept;
 	void notify() noexcept;
 	int last_error() const noexcept { return last_error_.load(std::memory_order_relaxed); }
 	NotificationBackend backend() const noexcept { return backend_; }
+	bool stopping() const noexcept { return stopping_.load(std::memory_order_acquire); }
 
        private:
 	NotificationServer() = default;
@@ -64,8 +67,11 @@ class NotificationServer {
 	std::string path_;
 	uint64_t socket_dev_{};
 	uint64_t socket_ino_{};
+	bool bound_{false};
 	UniqueFd listener_;
 	std::atomic<bool> stopping_{false};
+	std::atomic<bool> exited_{false};
+	CancellationToken owner_stop_;
 	std::atomic<int> last_error_{0};
 	std::thread thread_;
 	std::shared_ptr<NotificationSession> session_;

@@ -15,9 +15,11 @@
 
 #include "edge_runtime/channel/channel_abi.hpp"
 #include "edge_runtime/channel/consumer_impl.hpp"
+#include "edge_runtime/channel/control_operation.hpp"
 #include "edge_runtime/channel/notification_backend.hpp"
 #include "edge_runtime/channel/notification_service.hpp"
 #include "edge_runtime/channel/producer_impl.hpp"
+#include "edge_runtime/sync/cancellation.hpp"
 #include "edge_runtime/sync/clock.hpp"
 #include "edge_runtime/transport/fd_broker.hpp"
 #include "edge_runtime/transport/socket_io.hpp"
@@ -157,6 +159,7 @@ Result<std::shared_ptr<NotificationServer>> NotificationServer::start(ProducerHa
 	}
 	auto server = std::shared_ptr<NotificationServer>(new NotificationServer);
 	server->backend_ = backend;
+	server->owner_stop_ = handle.control_stop.token();
 	auto* base = static_cast<std::byte*>(handle.shm.mapping.get());
 	server->bootstrap_ = reinterpret_cast<BootstrapHeaderAbi*>(base);
 	server->header_ = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
@@ -166,19 +169,34 @@ Result<std::shared_ptr<NotificationServer>> NotificationServer::start(ProducerHa
 	server->owner_.producer = {handle.role_epoch, handle.self};
 	server->owner_.fingerprint = handle.schema_fingerprint;
 	server->path_ = channel_socket_path(handle.channel_name) + ".notify";
+	auto committing = control_begin_commit();
+	if (!committing) return committing.error();
 	auto listener = fd_broker_bind(server->path_);
 	if (!listener) return listener.error();
 	server->listener_ = std::move(listener.value());
+	server->bound_ = true;
+	handle.notification_server = server;
 	struct stat status {};
 	if (::lstat(server->path_.c_str(), &status) != 0 || !S_ISSOCK(status.st_mode) ||
-	    status.st_uid != ::geteuid()) return system_error("cannot bind socket inode");
+	    status.st_uid != ::geteuid()) {
+		server->request_stop();
+		auto error = make_error(ErrorCode::kRecoveryBlocked, kOperation,
+		                        "bound socket identity unavailable");
+		control_handle_pending(error);
+		return error;
+	}
 	server->socket_dev_ = static_cast<uint64_t>(status.st_dev);
 	server->socket_ino_ = static_cast<uint64_t>(status.st_ino);
 	try {
 		server->thread_ = std::thread([pointer = server.get()] { pointer->run(); });
 	} catch (...) {
-		return make_error(ErrorCode::kSystemError, kOperation, "notification thread start failed");
+		server->request_stop();
+		auto error = make_error(ErrorCode::kSystemError, kOperation,
+		                        "notification thread start failed");
+		control_handle_pending(error);
+		return error;
 	}
+	control_committed();
 	return server;
 }
 
@@ -190,8 +208,7 @@ void NotificationServer::replace_session(std::shared_ptr<NotificationSession> se
 }
 
 void NotificationServer::stop() noexcept {
-	stopping_.store(true, std::memory_order_release);
-	if (listener_.get() >= 0) (void)::shutdown(listener_.get(), SHUT_RDWR);
+	request_stop();
 	if (thread_.joinable()) thread_.join();
 	replace_session({});
 	struct stat status {};
@@ -201,6 +218,43 @@ void NotificationServer::stop() noexcept {
 		(void)::unlink(path_.c_str());
 	}
 	socket_ino_ = 0;
+}
+
+void NotificationServer::request_stop() noexcept {
+	stopping_.store(true, std::memory_order_release);
+	if (listener_.get() >= 0) (void)::shutdown(listener_.get(), SHUT_RDWR);
+}
+
+Result<void> NotificationServer::finalize(const ControlOperationContext& context) noexcept {
+	request_stop();
+	if (bound_ && socket_ino_ == 0)
+		return make_error(ErrorCode::kRecoveryBlocked, kOperation,
+		                  "bound socket identity unavailable");
+	while (thread_.joinable() && !exited_.load(std::memory_order_acquire)) {
+		auto available = context.check();
+		if (!available) return available;
+		auto paused = control_pause(1'000'000);
+		if (!paused) return paused;
+	}
+	auto available = context.check();
+	if (!available) return available;
+	if (thread_.joinable()) thread_.join();
+	replace_session({});
+	struct stat status {};
+	if (socket_ino_ != 0 && ::lstat(path_.c_str(), &status) == 0) {
+		if (!S_ISSOCK(status.st_mode) || status.st_uid != ::geteuid() ||
+		    static_cast<uint64_t>(status.st_dev) != socket_dev_ ||
+		    static_cast<uint64_t>(status.st_ino) != socket_ino_)
+			return make_error(ErrorCode::kNameRaceDetected, kOperation,
+			                  "notification socket changed");
+		if (!context.check()) return context.check();
+		if (::unlink(path_.c_str()) != 0) return system_error("notification unlink failed");
+	} else if (socket_ino_ != 0 && errno != ENOENT)
+		return system_error("notification lstat failed");
+	socket_ino_ = 0;
+	bound_ = false;
+	listener_.reset();
+	return Result<void>::ok();
 }
 
 void NotificationServer::notify() noexcept {
@@ -227,7 +281,8 @@ bool NotificationServer::binding_current(const NotificationRecord& record) noexc
 void NotificationServer::accept_peer(int fd) noexcept {
 	UniqueFd peer(fd);
 	const socket_io::IoBudget budget{
-	        monotonic_deadline_ns(kFdBrokerPeerIoTimeoutMs * 1'000'000), &stopping_};
+	        monotonic_deadline_ns(kFdBrokerPeerIoTimeoutMs * 1'000'000), &stopping_,
+	        &owner_stop_};
 	NotificationRecord request{};
 	if (!socket_io::peer_is_same_uid(fd) ||
 	    !socket_io::recv_full(fd, &request, sizeof(request), budget) ||
@@ -276,7 +331,7 @@ void NotificationServer::accept_peer(int fd) noexcept {
 }
 
 void NotificationServer::run() noexcept {
-	while (!stopping_.load(std::memory_order_acquire)) {
+	while (!stopping_.load(std::memory_order_acquire) && !owner_stop_.is_cancelled()) {
 		auto session = std::atomic_load(&session_);
 		struct pollfd descriptors[2]{{listener_.get(), POLLIN, 0},
 		                             {session ? session->peer.get() : -1, POLLIN | POLLRDHUP, 0}};
@@ -288,13 +343,14 @@ void NotificationServer::run() noexcept {
 		if (session && (descriptors[1].revents != 0 || !binding_current(session->record))) {
 			replace_session({});
 		}
-		if (stopping_.load(std::memory_order_acquire)) break;
+		if (stopping_.load(std::memory_order_acquire) || owner_stop_.is_cancelled()) break;
 		if (descriptors[0].revents & POLLIN) {
 			const int peer = ::accept4(listener_.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
 			if (peer >= 0) accept_peer(peer);
 		}
 	}
 	replace_session({});
+	exited_.store(true, std::memory_order_release);
 }
 
 struct EventNotificationState {
@@ -304,6 +360,22 @@ struct EventNotificationState {
 	UniqueFd event;
 	UniqueFd peer;
 	UniqueFd epoll;
+	void close() noexcept {
+		if (record.consumer.identity.pid != static_cast<uint64_t>(::getpid())) {
+			epoll.reset();
+			event.reset();
+			peer.reset();
+			return;
+		}
+		if (epoll.get() >= 0) {
+			(void)::epoll_ctl(epoll.get(), EPOLL_CTL_DEL, event.get(), nullptr);
+			(void)::epoll_ctl(epoll.get(), EPOLL_CTL_DEL, peer.get(), nullptr);
+		}
+		if (peer.get() >= 0) (void)::shutdown(peer.get(), SHUT_RDWR);
+		epoll.reset();
+		event.reset();
+		peer.reset();
+	}
 	~EventNotificationState() {
 		if (record.consumer.identity.pid == static_cast<uint64_t>(::getpid())) {
 			if (epoll.get() >= 0) {
@@ -315,6 +387,12 @@ struct EventNotificationState {
 		epoll.reset();
 	}
 };
+
+void consumer_clear_notifications(ConsumerHandle& handle) noexcept {
+	for (auto& item : handle.notifications)
+		if (auto state = item.lock()) state->close();
+	handle.notifications.clear();
+}
 
 namespace {
 Result<void> validate_state(const EventNotificationState& state) noexcept {
@@ -348,6 +426,8 @@ Result<EventNotification> consumer_event_notification_impl(
 	if (!notification_backend_valid(backend))
 		return make_error(ErrorCode::kInvalidOptions, kOperation, "unknown backend");
 	if (!handle) return make_error(ErrorCode::kStaleHandle, kOperation, "empty consumer");
+	auto available = control_check();
+	if (!available) return available.error();
 	ConsumerUse use(*handle);
 	if (!use.acquired) return make_error(ErrorCode::kConcurrentHandleUse, kOperation);
 	uint64_t timeout_ns = 0;
@@ -357,6 +437,11 @@ Result<EventNotification> consumer_event_notification_impl(
 	const socket_io::IoBudget budget{monotonic_deadline_ns(timeout_ns)};
 	if (budget.deadline_ns == 0) return make_error(ErrorCode::kClockAnomaly, kOperation);
 	auto state = std::make_shared<EventNotificationState>();
+	handle->notifications.erase(
+	        std::remove_if(handle->notifications.begin(), handle->notifications.end(),
+	                       [](const auto& registration) { return registration.expired(); }),
+	        handle->notifications.end());
+	handle->notifications.reserve(handle->notifications.size() + 1);
 	state->consumer = handle;
 	state->backend = backend;
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
@@ -415,18 +500,55 @@ Result<EventNotification> consumer_event_notification_impl(
 				state->epoll.reset(::epoll_create1(EPOLL_CLOEXEC));
 				if (state->epoll.get() < 0 || !epoll_add(state->epoll.get(), state->event.get(), 1) ||
 				    !epoll_add(state->epoll.get(), state->peer.get(), 2)) return system_error("epoll setup failed");
+				const int stop_fd = CancellationAccess::native_handle(
+				        handle->control_stop.token());
+				if (stop_fd < 0 || !epoll_add(state->epoll.get(), stop_fd, 3))
+					return system_error("stop epoll setup failed");
 				valid = validate_state(*state);
 				if (!valid) return valid.error();
-				if (!socket_io::budget_available(budget)) break;
+				auto committing = control_begin_commit();
+				if (!committing) return committing.error();
+				handle->notifications.push_back(state);
+				control_committed();
 				return EventNotification(std::move(state));
 			}
 		}
 		if (timeout_ms == 0) break;
 		const uint64_t remaining = remaining_time_ns(budget.deadline_ns);
 		if (remaining == 0) break;
-		(void)::poll(nullptr, 0, static_cast<int>(std::min(remaining / 1'000'000, uint64_t{10})));
+		if (control_context()) {
+			auto paused = control_pause(std::min(remaining, uint64_t{10'000'000}));
+			if (!paused) return paused.error();
+		} else
+			(void)::poll(
+			        nullptr, 0,
+			        static_cast<int>(std::min(remaining / 1'000'000, uint64_t{10})));
 	}
+	auto checked = control_check();
+	if (!checked) return checked.error();
 	return make_error(ErrorCode::kTimeout, kOperation, "notification registration deadline exhausted");
+}
+
+Result<EventNotification> consumer_notification_controlled(
+        const std::shared_ptr<ConsumerHandle>& handle, NotificationBackend backend,
+        const ControlOperationContext& context, ControlReceipt& receipt) {
+	if (handle && handle->owner_pid != static_cast<uint64_t>(::getpid()))
+		return make_error(ErrorCode::kStaleHandle, kOperation, "foreign process handle");
+	if (receipt.has_pending_cleanup())
+		return make_error(ErrorCode::kRecoveryBlocked, kOperation,
+		                  "finalize receipt first");
+	ControlScope scope(context, receipt,
+	                   handle ? handle->control_stop.token() : CancellationToken{});
+	auto checked = control_check();
+	if (!checked) return checked.error();
+	const uint64_t remaining = remaining_time_ns(context.deadline_ns());
+	auto result = consumer_event_notification_impl(
+	        handle, remaining / 1'000'000 + (remaining % 1'000'000 != 0 ? 1 : 0), backend);
+	if (!result) {
+		checked = control_check();
+		if (!checked) return checked.error();
+	}
+	return result;
 }
 }
 

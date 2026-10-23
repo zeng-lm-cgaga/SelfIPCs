@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(
   SelfIPCs
-  VERSION 0.5.0
+  VERSION 0.5.1
   DESCRIPTION "Linux C++17 IPC: latest-value channels, bounded MPMC queues and shared buffer pools"
   LANGUAGES CXX)
 
